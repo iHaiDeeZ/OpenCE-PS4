@@ -1,0 +1,2 @@
+9662f0f6cb60746444bee9549e4271e387fdc659
+(OpenCommunityEdition/OpenCE main, 2026-10-20: Merge pull request #426 from OpenCommunityEdition/readme-rewrite)

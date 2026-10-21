@@ -1,0 +1,18 @@
+# the game data and disc images: never in this repository
+# the game: never in this repository (dumps, keys, generated code, staged data)
+*.elf
+*.iso
+*.keys
+*.nsp
+*.oelf
+*.pkg
+*.tar
+*.xci
+*.xiso
+build/
+dump/
+logs/
+maps/
+modules/
+out/
+private/

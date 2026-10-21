@@ -1,0 +1,6153 @@
+diff --git a/configure.py b/configure.py
+index 1ea8989f..ef64d0f4 100644
+--- a/configure.py
++++ b/configure.py
+@@ -13,6 +13,7 @@ from types import SimpleNamespace
+ from tools import ninja_syntax
+ from tools.android_build import android_configure_inputs, generate_android_build
+ from tools.linux_build import check_profile_options, generate_linux_build, linux_configure_inputs
++from tools.ps4_build import generate_ps4_build, ps4_configure_inputs
+ from tools.web_build import generate_web_build, web_configure_inputs
+ from tools.windows_build import generate_windows_build, windows_configure_inputs
+ 
+@@ -89,6 +90,28 @@ parser.add_argument(
+     type=str,
+     help="clang with the arm64_32 target for the Android guest (default: clang)",
+ )
++parser.add_argument(
++    "--ps4-gl-include",
++    metavar="DIR",
++    type=Path,
++    help="the Khronos OpenGL ES headers (GLES3/, GLES2/, KHR/) for `ninja ps4`, such as Mesa's include/; "
++    "without it the PS4 build is not generated (port/ps4/README.md)",
++)
++parser.add_argument(
++    "--ps4-guest-cc",
++    type=str,
++    help="clang with the x86_64-linux-gnux32 target for the PS4 guest (default: clang)",
++)
++parser.add_argument(
++    "--ps4-guest-ld",
++    type=str,
++    help="ld.lld for the PS4 guest image (default: ld.lld)",
++)
++parser.add_argument(
++    "--ps4-guest-ar",
++    type=str,
++    help="llvm-ar for the PS4 guest's C library (default: llvm-ar)",
++)
+ parser.add_argument(
+     "--web-emcc",
+     type=str,
+@@ -146,6 +169,10 @@ sln = SimpleNamespace(
+     android_ndk=args.android_ndk,
+     android_guest_cc=args.android_guest_cc,
+     web_emcc=args.web_emcc,
++    ps4_gl_include=args.ps4_gl_include,
++    ps4_guest_cc=args.ps4_guest_cc,
++    ps4_guest_ld=args.ps4_guest_ld,
++    ps4_guest_ar=args.ps4_guest_ar,
+ )
+ if not is_windows():
+     sln.windows_cc = args.windows_cc
+@@ -173,6 +200,7 @@ generate_linux_build(n, sln)
+ generate_android_build(n, sln)
+ generate_windows_build(n, sln)
+ generate_web_build(n, sln)
++generate_ps4_build(n, sln)
+ 
+ n.comment("Reconfigure on change")
+ n.rule(
+@@ -191,6 +219,7 @@ n.build(
+         *android_configure_inputs(),
+         *windows_configure_inputs(),
+         *web_configure_inputs(),
++        *ps4_configure_inputs(),
+     ],
+ )
+ n.newline()
+diff --git a/port/android/guest/runtime/guest_start.c b/port/android/guest/runtime/guest_start.c
+index 8242ec50..2bc7c5bb 100644
+--- a/port/android/guest/runtime/guest_start.c
++++ b/port/android/guest/runtime/guest_start.c
+@@ -30,7 +30,13 @@ void __guest_thread_initialize_main(void);
+ 
+ extern char **__environ;
+ 
++/* (the Darwin target's section name, which the Android build's assembly
++conversion renames; the PS4's x32 guest is ELF already) */
++#ifdef HALO_X32_GUEST
++__attribute__((section(".guest_header"), used))
++#else
+ __attribute__((section("__TEXT,__guest_header"), used))
++#endif
+ const struct halo_guest_header __guest_header =
+ {
+ 	HALO_GUEST_MAGIC,
+diff --git a/port/linux/include/halo_linux_prefix.h b/port/linux/include/halo_linux_prefix.h
+index 16bcbfd2..8ba8dfff 100644
+--- a/port/linux/include/halo_linux_prefix.h
++++ b/port/linux/include/halo_linux_prefix.h
+@@ -10,7 +10,7 @@ byte-for-byte identical to what the matching MSVC build compiles.
+ #ifndef __HALO_LINUX_PREFIX_H
+ #define __HALO_LINUX_PREFIX_H
+ 
+-#if !defined(__i386__) && !defined(HALO_ARM64_GUEST) && !defined(__wasm32__)
++#if !defined(__i386__) && !defined(HALO_ARM64_GUEST) && !defined(HALO_X32_GUEST) && !defined(__wasm32__)
+ #error the Linux port targets 32-bit x86: game data structures assume 32-bit pointers
+ #endif
+ 
+diff --git a/port/linux/include/halo_port_capacity.h b/port/linux/include/halo_port_capacity.h
+index d7ca06b3..58a0fb16 100644
+--- a/port/linux/include/halo_port_capacity.h
++++ b/port/linux/include/halo_port_capacity.h
+@@ -46,7 +46,7 @@ measurement). The desktop builds' cache is 256 MB, half their 512 MB memory
+ window (port/linux/src/platform.h), whose pages are backed as they are used.
+ Android's window is 128 MB, as the web build's, and its cache the Xbox's. */
+ 
+-#if defined(HALO_ARM64_GUEST) || defined(HALO_WEB)
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST) || defined(HALO_WEB)
+ #define HALO_PORT_TEXTURE_CACHE_PAGE_COUNT 0x580 /* (0x580) */
+ #else
+ #define HALO_PORT_TEXTURE_CACHE_PAGE_COUNT 0x4000 /* (0x580) */
+@@ -63,7 +63,7 @@ campaign map's dialogue and music did, "SOUND CACHE BLOWN" in debug.txt).
+ The desktop builds' cache is 16 MB; Android's and the web build's windows keep
+ the Xbox's. */
+ 
+-#if defined(HALO_ARM64_GUEST) || defined(HALO_WEB)
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST) || defined(HALO_WEB)
+ #define HALO_PORT_SOUND_CACHE_SIZE 0x400000 /* (0x400000) */
+ #else
+ #define HALO_PORT_SOUND_CACHE_SIZE 0x1000000 /* (0x400000) */
+@@ -81,7 +81,7 @@ outside the game state, and nothing of them reaches the network, so
+ machines with other limits still play the same game. Android's and the web
+ build's keep the Xbox's. (The transparent geometry groups: below.) */
+ 
+-#if defined(HALO_ARM64_GUEST) || defined(HALO_WEB)
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST) || defined(HALO_WEB)
+ #define HALO_PORT_MAXIMUM_RENDERED_PARTICLE_GROUPS 512 /* (512) */
+ #define HALO_PORT_MAXIMUM_RENDERED_LIGHTS 128 /* (128) */
+ #else
+diff --git a/port/linux/src/dsound_sdl.c b/port/linux/src/dsound_sdl.c
+index 01fb4f18..b89cc03d 100644
+--- a/port/linux/src/dsound_sdl.c
++++ b/port/linux/src/dsound_sdl.c
+@@ -1598,7 +1598,7 @@ static void *silent_clock_thread(void *parameter)
+ at least six channels. Android and the browser play stereo */
+ static unsigned long choose_output_channels(SDL_AudioDeviceID device)
+ {
+-#if defined(HALO_ANDROID) || defined(HALO_WEB) || defined(HALO_ARM64_GUEST)
++#if defined(HALO_ANDROID) || defined(HALO_WEB) || defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 	(void)device;
+ 	return 2;
+ #else
+@@ -1642,7 +1642,7 @@ static void audio_start(void)
+ 		spec.format = SDL_AUDIO_F32;
+ 		spec.channels = (int)output_channels;
+ 		spec.freq = OUTPUT_RATE;
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 		/* frames per callback: on Android each callback is handed to a thread
+ 		that can run the guest (host_sdl.c): 512 left it too little time and
+ 		the menus' music broke up, which 1024 does not (about 21 ms at 48 kHz,
+diff --git a/port/linux/src/menu_files.c b/port/linux/src/menu_files.c
+index 7b040ae0..5702b8bb 100644
+--- a/port/linux/src/menu_files.c
++++ b/port/linux/src/menu_files.c
+@@ -99,7 +99,7 @@ static long file_add(const char *path, const unsigned char *data, unsigned long
+ 
+ static unsigned char *file_read(const char *path, unsigned long *size)
+ {
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 	FILE *file = fopen(path, "rb");
+ 	unsigned char *data = NULL;
+ 	long length;
+diff --git a/port/linux/src/msvc_crt.c b/port/linux/src/msvc_crt.c
+index a8515164..ecbe3739 100644
+--- a/port/linux/src/msvc_crt.c
++++ b/port/linux/src/msvc_crt.c
+@@ -351,6 +351,52 @@ unsigned int _clearfp(void)
+ 	__builtin_arm_wsr64("fpsr", __builtin_arm_rsr64("fpsr") & ~0x9fULL);
+ 	return status;
+ }
++#elif defined(HALO_X32_GUEST)
++/* x32 (the PS4's guest): SSE arithmetic, whose rounding mode and sticky
++exception flags live in MXCSR. Precision control and exception unmasking
++have no equivalent; the rest of the MSVC control word is only remembered. */
++static unsigned int msvc_control_word = CW_DEFAULT;
++
++unsigned int _control87(unsigned int new_value, unsigned int mask)
++{
++	unsigned int mxcsr;
++
++	if (mask)
++	{
++		msvc_control_word = (msvc_control_word & ~mask) | (new_value & mask);
++		mxcsr = __builtin_ia32_stmxcsr() & ~(3u << 13);
++		switch (msvc_control_word & _MCW_RC)
++		{
++		case _RC_DOWN: mxcsr |= 1u << 13; break;
++		case _RC_UP: mxcsr |= 2u << 13; break;
++		case _RC_CHOP: mxcsr |= 3u << 13; break;
++		default: break;
++		}
++		__builtin_ia32_ldmxcsr(mxcsr);
++	}
++	return msvc_control_word;
++}
++
++unsigned int _controlfp(unsigned int new_value, unsigned int mask)
++{
++	/* _controlfp ignores the denormal mask */
++	return _control87(new_value, mask & ~_EM_DENORMAL);
++}
++
++unsigned int _statusfp(void)
++{
++	/* invalid, denormal, zero divide, overflow, underflow, precision: the
++	same low bits as the x87 status word's */
++	return __builtin_ia32_stmxcsr() & 0x3f;
++}
++
++unsigned int _clearfp(void)
++{
++	unsigned int status = _statusfp();
++
++	__builtin_ia32_ldmxcsr(__builtin_ia32_stmxcsr() & ~0x3fu);
++	return status;
++}
+ #elif defined(HALO_WEB)
+ /* WebAssembly: rounding to nearest and no exception flags, always. The MSVC
+ control word is only remembered, so that the game reads back what it set. */
+diff --git a/port/linux/src/platform.h b/port/linux/src/platform.h
+index 65360cf8..c5123dfb 100644
+--- a/port/linux/src/platform.h
++++ b/port/linux/src/platform.h
+@@ -143,8 +143,8 @@ that window at start-up and hands out page-granular blocks from it, so the
+ physical/virtual arithmetic the game and Direct3D rely on keeps working. */
+ 
+ #define PLATFORM_CONTIGUOUS_BASE 0x80000000UL
+-#if defined(HALO_ARM64_GUEST) || defined(HALO_WEB)
+-/* 128 MB, a development kit's: Android's guest image is linked just above
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST) || defined(HALO_WEB)
++/* 128 MB, a development kit's: Android's (and the PS4's) guest image is linked just above
+ the window (port/android/include/halo_android_abi.h), and the web build's
+ WebAssembly memory ends with it (tools/web_build.py) */
+ #define PLATFORM_CONTIGUOUS_SIZE 0x08000000UL
+diff --git a/port/linux/src/port_config.c b/port/linux/src/port_config.c
+index 76b16c4e..836a01e9 100644
+--- a/port/linux/src/port_config.c
++++ b/port/linux/src/port_config.c
+@@ -847,7 +847,7 @@ static void config_path(char *path, size_t size)
+ /* the whole file, NUL terminated, or NULL; free() it */
+ static char *config_read_file(const char *path, size_t *size)
+ {
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 	FILE *file = fopen(path, "rb");
+ 	char *text = NULL;
+ 	long length;
+@@ -890,7 +890,7 @@ static char *config_read_file(const char *path, size_t *size)
+ 
+ static int config_write_file(const char *path, const char *text)
+ {
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 	FILE *file = fopen(path, "wb");
+ 	int written;
+ 
+diff --git a/port/linux/src/port_mods.c b/port/linux/src/port_mods.c
+index 64ca369f..0aedbb5b 100644
+--- a/port/linux/src/port_mods.c
++++ b/port/linux/src/port_mods.c
+@@ -777,13 +777,13 @@ static int text_file_write(const char *path, const char *text)
+ {
+ 	char temporary[MAXIMUM_PATH_LENGTH];
+ 	int written;
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 	FILE *file;
+ #endif
+ 
+ 	if (snprintf(temporary, sizeof(temporary), "%s.new", path) >= (int)sizeof(temporary))
+ 		return 0;
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 	/* (the guest's own C library: SDL's are the host's) */
+ 	file = fopen(temporary, "wb");
+ 	if (!file)
+@@ -1011,7 +1011,7 @@ int port_mods_file_read(long file, unsigned long offset, void *buffer, unsigned
+ 	unsigned char *staging = NULL;
+ 	unsigned long done = 0;
+ 	int read = 1;
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 	FILE *stream;
+ #else
+ 	SDL_IOStream *stream;
+@@ -1022,7 +1022,7 @@ int port_mods_file_read(long file, unsigned long offset, void *buffer, unsigned
+ 	path = port_mods.files[file].path;
+ 	if (bounce && !(staging = malloc(READ_BOUNCE_SIZE)))
+ 		return 0;
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 	stream = fopen(path, "rb");
+ 	if (!stream || fseek(stream, (long)offset, SEEK_SET) != 0)
+ 		read = 0;
+@@ -1039,7 +1039,7 @@ int port_mods_file_read(long file, unsigned long offset, void *buffer, unsigned
+ 
+ 		if (bounce && wanted > READ_BOUNCE_SIZE)
+ 			wanted = READ_BOUNCE_SIZE;
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 		read = fread(bounce ? staging : destination, 1, wanted, stream) == wanted;
+ #else
+ 		read = SDL_ReadIO(stream, bounce ? staging : destination, wanted) == wanted;
+@@ -1053,7 +1053,7 @@ int port_mods_file_read(long file, unsigned long offset, void *buffer, unsigned
+ 	}
+ 	if (stream)
+ 	{
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 		fclose(stream);
+ #else
+ 		SDL_CloseIO(stream);
+diff --git a/port/linux/src/sdl_platform.c b/port/linux/src/sdl_platform.c
+index c30bf4c4..66c78ee6 100644
+--- a/port/linux/src/sdl_platform.c
++++ b/port/linux/src/sdl_platform.c
+@@ -30,7 +30,7 @@ void win32_window_borderless_apply(SDL_Window *window);
+ #if !defined(_WIN32) && !defined(HALO_ANDROID)
+ #include <signal.h>
+ #endif
+-#if defined(__linux__) && !defined(HALO_ARM64_GUEST) && !defined(HALO_ANDROID)
++#if defined(__linux__) && !defined(HALO_ARM64_GUEST) && !defined(HALO_X32_GUEST) && !defined(HALO_ANDROID)
+ #include <dlfcn.h>
+ #include <unistd.h>
+ #endif
+@@ -174,7 +174,7 @@ static void data_check_maps(void)
+ }
+ #endif
+ 
+-#if defined(__linux__) && !defined(HALO_ARM64_GUEST) && !defined(HALO_ANDROID)
++#if defined(__linux__) && !defined(HALO_ARM64_GUEST) && !defined(HALO_X32_GUEST) && !defined(HALO_ANDROID)
+ /* NVIDIA's driver draws into a Wayland window through its egl-wayland
+ library, which distributions ship 64-bit only (Arch has no lib32 package
+ of it). In this 32-bit game, OpenGL on Wayland (EGL) then falls back to
+@@ -219,7 +219,7 @@ BOOL platform_sdl_initialize(void)
+ 	if (p2p_hand_off_invite())
+ 		exit(EXIT_SUCCESS);
+ 	SDL_SetHint(SDL_HINT_APP_NAME, "Halo");
+-#if defined(__linux__) && !defined(HALO_ARM64_GUEST) && !defined(HALO_ANDROID)
++#if defined(__linux__) && !defined(HALO_ARM64_GUEST) && !defined(HALO_X32_GUEST) && !defined(HALO_ANDROID)
+ 	platform_choose_video_driver();
+ #endif
+ #ifdef HALO_ANDROID
+@@ -2109,7 +2109,7 @@ void platform_pump_events(void)
+ 			break;
+ #endif
+ 		case SDL_EVENT_GAMEPAD_ADDED:
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 			/* (the guest reaches SDL only through host_imports.list, which
+ 			has no SDL_GetGamepadName) */
+ 			SDL_OpenGamepad(event.gdevice.which);
+diff --git a/port/linux/src/updater.c b/port/linux/src/updater.c
+index be3a447f..94b3a3c0 100644
+--- a/port/linux/src/updater.c
++++ b/port/linux/src/updater.c
+@@ -29,7 +29,7 @@ update.h's: posix_update.c on Linux, win32_update.c on Windows.
+ #include "port_config.h"
+ #include "update.h"
+ 
+-#if !defined(HALO_ANDROID) && !defined(HALO_WEB)
++#if !defined(HALO_ANDROID) && !defined(HALO_WEB) && !defined(HALO_PS4)
+ 
+ #include "zlib_prefixed.h"
+ 
+@@ -793,10 +793,11 @@ void updater_start(void)
+ {
+ }
+ 
+-#ifdef HALO_WEB
++#if defined(HALO_WEB) || defined(HALO_PS4)
+ #include <SDL3/SDL.h>
+ 
+-/* (the site updates itself: port/web/site/sw.js) */
++/* (the site updates itself: port/web/site/sw.js; the PS4's package is
++installed again) */
+ void updater_poll(SDL_Window *window)
+ {
+ 	(void)window;
+diff --git a/port/ps4/guest/guest.ld b/port/ps4/guest/guest.ld
+new file mode 100644
+index 00000000..3d3e12ed
+--- /dev/null
++++ b/port/ps4/guest/guest.ld
+@@ -0,0 +1,30 @@
++/*
++GUEST.LD
++
++Layout of the PS4 guest image (tools/ps4_build.py): x32 code (x86-64
++instructions, 32-bit pointers) linked to run at HALO_GUEST_IMAGE_BASE
++(port/android/include/halo_android_abi.h), with the image header first. The
++host maps the loadable segments at these addresses (port/ps4/host/host_loader.c).
++*/
++
++ENTRY(__guest_header)
++
++SECTIONS
++{
++	. = 0x88000000;
++	.guest_header : { KEEP(*(.guest_header)) }
++	.text : { *(.text .text.*) }
++	.rodata : { *(.rodata .rodata.*) }
++	. = ALIGN(0x10000);
++	.data : { *(.data .data.*) *(.data.rel.ro .data.rel.ro.*) *(.got) *(.got.plt) }
++	.guest_init : {
++		__guest_init_start = .;
++		KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
++		KEEP(*(.init_array))
++		__guest_init_end = .;
++	}
++	.bss : { *(.bss .bss.*) *(COMMON) }
++	. = ALIGN(0x4000);
++	__guest_image_end = .;
++	/DISCARD/ : { *(.comment) *(.note.*) *(.fini_array .fini_array.*) *(.eh_frame) *(.eh_frame_hdr) }
++}
+diff --git a/port/ps4/guest/guest_sdl_ps4.c b/port/ps4/guest/guest_sdl_ps4.c
+new file mode 100644
+index 00000000..9292e6f6
+--- /dev/null
++++ b/port/ps4/guest/guest_sdl_ps4.c
+@@ -0,0 +1,571 @@
++/*
++GUEST_SDL_PS4.C
++
++The rest of the SDL3 functions the platform layer calls on the PS4. The
++Android guest's guest_sdl.c bridges those that Android's code paths use;
++the PS4 takes the desktop paths (the settings beside the game, the disc
++image's extraction, the display modes), whose SDL functions are answered here,
++in the guest, for a console with one fixed screen, no mouse, no keyboard,
++no file dialog and no SDL renderer (the extraction then shows no progress
++window).
++*/
++
++#include <dirent.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <strings.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <SDL3/SDL.h>
++
++#include "guest_host.h"
++
++/* ---------- atomics, mutexes, threads */
++
++int SDL_AddAtomicInt(SDL_AtomicInt *atomic, int value)
++{
++	return __atomic_fetch_add(&atomic->value, value, __ATOMIC_SEQ_CST);
++}
++
++int SDL_GetAtomicInt(SDL_AtomicInt *atomic)
++{
++	return __atomic_load_n(&atomic->value, __ATOMIC_SEQ_CST);
++}
++
++int SDL_SetAtomicInt(SDL_AtomicInt *atomic, int value)
++{
++	return __atomic_exchange_n(&atomic->value, value, __ATOMIC_SEQ_CST);
++}
++
++SDL_Mutex *SDL_CreateMutex(void)
++{
++	pthread_mutex_t *mutex = malloc(sizeof(*mutex));
++
++	if (mutex)
++		pthread_mutex_init(mutex, NULL);
++	return (SDL_Mutex *)mutex;
++}
++
++void SDL_LockMutex(SDL_Mutex *mutex)
++{
++	if (mutex)
++		pthread_mutex_lock((pthread_mutex_t *)mutex);
++}
++
++void SDL_UnlockMutex(SDL_Mutex *mutex)
++{
++	if (mutex)
++		pthread_mutex_unlock((pthread_mutex_t *)mutex);
++}
++
++void SDL_DestroyMutex(SDL_Mutex *mutex)
++{
++	if (mutex)
++	{
++		pthread_mutex_destroy((pthread_mutex_t *)mutex);
++		free(mutex);
++	}
++}
++
++Uint64 SDL_GetTicksNS(void)
++{
++	struct timespec now;
++
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	return (Uint64)now.tv_sec * 1000000000ull + (Uint64)now.tv_nsec;
++}
++
++void SDL_DelayPrecise(Uint64 nanoseconds)
++{
++	struct timespec duration;
++
++	duration.tv_sec = (time_t)(nanoseconds / 1000000000ull);
++	duration.tv_nsec = (long)(nanoseconds % 1000000000ull);
++	nanosleep(&duration, NULL);
++}
++
++bool SDL_GetHintBoolean(const char *name, bool default_value)
++{
++	(void)name;
++	return default_value;
++}
++
++/* ---------- properties: none kept */
++
++SDL_PropertiesID SDL_CreateProperties(void)
++{
++	return 1;
++}
++
++void SDL_DestroyProperties(SDL_PropertiesID properties)
++{
++	(void)properties;
++}
++
++bool SDL_SetBooleanProperty(SDL_PropertiesID properties, const char *name, bool value)
++{
++	(void)properties;
++	(void)name;
++	(void)value;
++	return true;
++}
++
++bool SDL_SetNumberProperty(SDL_PropertiesID properties, const char *name, Sint64 value)
++{
++	(void)properties;
++	(void)name;
++	(void)value;
++	return true;
++}
++
++bool SDL_GetBooleanProperty(SDL_PropertiesID properties, const char *name, bool default_value)
++{
++	(void)properties;
++	(void)name;
++	return default_value;
++}
++
++float SDL_GetFloatProperty(SDL_PropertiesID properties, const char *name, float default_value)
++{
++	(void)properties;
++	(void)name;
++	return default_value;
++}
++
++/* ---------- the screen: one display, one mode, the window always on it */
++
++static SDL_DisplayMode screen_mode(void)
++{
++	SDL_DisplayMode mode;
++	int width = 1920, height = 1080;
++
++	host_sdl_window_size_in_pixels(1, &width, &height);
++	memset(&mode, 0, sizeof(mode));
++	mode.displayID = 1;
++	mode.format = SDL_PIXELFORMAT_ABGR8888;
++	mode.w = width;
++	mode.h = height;
++	mode.pixel_density = 1.0f;
++	mode.refresh_rate = 60.0f;
++	mode.refresh_rate_numerator = 60;
++	mode.refresh_rate_denominator = 1;
++	return mode;
++}
++
++static SDL_DisplayMode current_mode;
++
++SDL_DisplayID SDL_GetPrimaryDisplay(void)
++{
++	return 1;
++}
++
++SDL_DisplayID SDL_GetDisplayForWindow(SDL_Window *window)
++{
++	(void)window;
++	return 1;
++}
++
++const SDL_DisplayMode *SDL_GetDesktopDisplayMode(SDL_DisplayID display)
++{
++	(void)display;
++	current_mode = screen_mode();
++	return &current_mode;
++}
++
++const SDL_DisplayMode *SDL_GetCurrentDisplayMode(SDL_DisplayID display)
++{
++	return SDL_GetDesktopDisplayMode(display);
++}
++
++SDL_DisplayMode **SDL_GetFullscreenDisplayModes(SDL_DisplayID display, int *count)
++{
++	/* (one allocation, as SDL's: the pointers, then the mode) */
++	SDL_DisplayMode **modes = malloc(2 * sizeof(SDL_DisplayMode *) + sizeof(SDL_DisplayMode));
++
++	(void)display;
++	if (!modes)
++		return NULL;
++	modes[0] = (SDL_DisplayMode *)(modes + 2);
++	*modes[0] = screen_mode();
++	modes[1] = NULL;
++	if (count)
++		*count = 1;
++	return modes;
++}
++
++bool SDL_GetClosestFullscreenDisplayMode(SDL_DisplayID display, int w, int h, float refresh_rate,
++	bool include_high_density_modes, SDL_DisplayMode *closest)
++{
++	(void)display;
++	(void)w;
++	(void)h;
++	(void)refresh_rate;
++	(void)include_high_density_modes;
++	*closest = screen_mode();
++	return true;
++}
++
++bool SDL_GetDisplayUsableBounds(SDL_DisplayID display, SDL_Rect *rect)
++{
++	SDL_DisplayMode mode = screen_mode();
++
++	(void)display;
++	rect->x = rect->y = 0;
++	rect->w = mode.w;
++	rect->h = mode.h;
++	return true;
++}
++
++const char *SDL_GetCurrentVideoDriver(void)
++{
++	return "ps4";
++}
++
++SDL_WindowFlags SDL_GetWindowFlags(SDL_Window *window)
++{
++	(void)window;
++	return SDL_WINDOW_FULLSCREEN | SDL_WINDOW_OPENGL | SDL_WINDOW_INPUT_FOCUS;
++}
++
++SDL_PropertiesID SDL_GetWindowProperties(SDL_Window *window)
++{
++	(void)window;
++	return 1;
++}
++
++bool SDL_GetWindowSize(SDL_Window *window, int *w, int *h)
++{
++	return SDL_GetWindowSizeInPixels(window, w, h);
++}
++
++bool SDL_SetWindowSize(SDL_Window *window, int w, int h)
++{
++	(void)window;
++	(void)w;
++	(void)h;
++	return true;
++}
++
++bool SDL_SetWindowFullscreen(SDL_Window *window, bool fullscreen)
++{
++	(void)window;
++	(void)fullscreen;
++	return true;
++}
++
++bool SDL_SetWindowFullscreenMode(SDL_Window *window, const SDL_DisplayMode *mode)
++{
++	(void)window;
++	(void)mode;
++	return true;
++}
++
++void SDL_DestroyWindow(SDL_Window *window)
++{
++	(void)window;
++}
++
++SDL_Window *SDL_GetKeyboardFocus(void)
++{
++	return (SDL_Window *)1;
++}
++
++/* ---------- no mouse, no keyboard */
++
++bool SDL_SetWindowMouseGrab(SDL_Window *window, bool grabbed)
++{
++	(void)window;
++	(void)grabbed;
++	return true;
++}
++
++void SDL_WarpMouseInWindow(SDL_Window *window, float x, float y)
++{
++	(void)window;
++	(void)x;
++	(void)y;
++}
++
++bool SDL_HideCursor(void)
++{
++	return true;
++}
++
++bool SDL_ShowCursor(void)
++{
++	return true;
++}
++
++bool SDL_HasScreenKeyboardSupport(void)
++{
++	return false;
++}
++
++bool SDL_StartTextInputWithProperties(SDL_Window *window, SDL_PropertiesID properties)
++{
++	(void)window;
++	(void)properties;
++	return false;
++}
++
++bool SDL_StopTextInput(SDL_Window *window)
++{
++	(void)window;
++	return true;
++}
++
++bool SDL_TextInputActive(SDL_Window *window)
++{
++	(void)window;
++	return false;
++}
++
++SDL_Keycode SDL_GetKeyFromScancode(SDL_Scancode scancode, SDL_Keymod modstate, bool key_event)
++{
++	(void)scancode;
++	(void)modstate;
++	(void)key_event;
++	return SDLK_UNKNOWN;
++}
++
++/* ---------- events */
++
++void SDL_PumpEvents(void)
++{
++}
++
++/* (only the menus' Quit pushes one: the game ends, as on Android) */
++bool SDL_PushEvent(SDL_Event *event)
++{
++	if (event && event->type == SDL_EVENT_QUIT)
++		exit(EXIT_SUCCESS);
++	return true;
++}
++
++/* ---------- no renderer (the extraction draws no progress window) */
++
++SDL_Renderer *SDL_CreateRenderer(SDL_Window *window, const char *name)
++{
++	(void)window;
++	(void)name;
++	return NULL;
++}
++
++void SDL_DestroyRenderer(SDL_Renderer *renderer)
++{
++	(void)renderer;
++}
++
++bool SDL_SetRenderVSync(SDL_Renderer *renderer, int vsync)
++{
++	(void)renderer;
++	(void)vsync;
++	return false;
++}
++
++bool SDL_SetRenderDrawColor(SDL_Renderer *renderer, Uint8 r, Uint8 g, Uint8 b, Uint8 a)
++{
++	(void)renderer;
++	(void)r;
++	(void)g;
++	(void)b;
++	(void)a;
++	return false;
++}
++
++bool SDL_SetRenderScale(SDL_Renderer *renderer, float x, float y)
++{
++	(void)renderer;
++	(void)x;
++	(void)y;
++	return false;
++}
++
++bool SDL_RenderClear(SDL_Renderer *renderer)
++{
++	(void)renderer;
++	return false;
++}
++
++bool SDL_RenderFillRect(SDL_Renderer *renderer, const SDL_FRect *rect)
++{
++	(void)renderer;
++	(void)rect;
++	return false;
++}
++
++bool SDL_RenderDebugText(SDL_Renderer *renderer, float x, float y, const char *text)
++{
++	(void)renderer;
++	(void)x;
++	(void)y;
++	(void)text;
++	return false;
++}
++
++bool SDL_RenderPresent(SDL_Renderer *renderer)
++{
++	(void)renderer;
++	return false;
++}
++
++/* ---------- audio devices: the console's output */
++
++SDL_AudioDeviceID *SDL_GetAudioPlaybackDevices(int *count)
++{
++	SDL_AudioDeviceID *devices = calloc(2, sizeof(*devices));
++
++	if (count)
++		*count = 0;
++	return devices;
++}
++
++SDL_AudioDeviceID *SDL_GetAudioRecordingDevices(int *count)
++{
++	return SDL_GetAudioPlaybackDevices(count);
++}
++
++const char *SDL_GetAudioDeviceName(SDL_AudioDeviceID device)
++{
++	(void)device;
++	return "PS4";
++}
++
++/* ---------- files */
++
++/* the data folder (HALO_DATA_ROOT, /data/OpenCE), where a desktop game
++keeps its settings beside the executable */
++const char *SDL_GetBasePath(void)
++{
++	static char path[512];
++
++	if (!path[0])
++	{
++		const char *root = getenv("HALO_DATA_ROOT");
++
++		snprintf(path, sizeof(path), "%s/", root && *root ? root : ".");
++	}
++	return path;
++}
++
++bool SDL_GetPathInfo(const char *path, SDL_PathInfo *info)
++{
++	struct stat information;
++
++	if (stat(path, &information) != 0)
++		return false;
++	if (info)
++	{
++		memset(info, 0, sizeof(*info));
++		info->type = S_ISDIR(information.st_mode) ? SDL_PATHTYPE_DIRECTORY :
++			S_ISREG(information.st_mode) ? SDL_PATHTYPE_FILE : SDL_PATHTYPE_OTHER;
++		info->size = (Uint64)information.st_size;
++		info->modify_time = (SDL_Time)information.st_mtime * 1000000000;
++		info->access_time = (SDL_Time)information.st_atime * 1000000000;
++		info->create_time = (SDL_Time)information.st_ctime * 1000000000;
++	}
++	return true;
++}
++
++/* a glob of * and ? (what the platform layer's patterns are) */
++static int glob_match(const char *pattern, const char *name, int ignore_case)
++{
++	for (;;)
++	{
++		if (*pattern == '*')
++		{
++			pattern++;
++			if (!*pattern)
++				return 1;
++			for (; *name; name++)
++			{
++				if (glob_match(pattern, name, ignore_case))
++					return 1;
++			}
++			return 0;
++		}
++		if (!*name)
++			return !*pattern;
++		if (*pattern != '?')
++		{
++			int a = (unsigned char)*pattern, b = (unsigned char)*name;
++
++			if (ignore_case)
++			{
++				a = a >= 'A' && a <= 'Z' ? a + 32 : a;
++				b = b >= 'A' && b <= 'Z' ? b + 32 : b;
++			}
++			if (a != b)
++				return 0;
++		}
++		pattern++;
++		name++;
++	}
++}
++
++/* the names in path matching pattern: one allocation (the pointers, then
++the strings), as SDL's */
++char **SDL_GlobDirectory(const char *path, const char *pattern, SDL_GlobFlags flags, int *count)
++{
++	DIR *directory = opendir(path);
++	struct dirent *entry;
++	size_t pointers = 0, bytes = 0;
++	char **result;
++	char *strings;
++	int found = 0;
++
++	if (count)
++		*count = 0;
++	if (!directory)
++		return NULL;
++	while ((entry = readdir(directory)) != NULL)
++	{
++		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
++			continue;
++		if (pattern && !glob_match(pattern, entry->d_name, (flags & SDL_GLOB_CASEINSENSITIVE) != 0))
++			continue;
++		pointers++;
++		bytes += strlen(entry->d_name) + 1;
++	}
++	result = malloc((pointers + 1) * sizeof(char *) + bytes);
++	if (!result)
++	{
++		closedir(directory);
++		return NULL;
++	}
++	strings = (char *)(result + pointers + 1);
++	rewinddir(directory);
++	while ((entry = readdir(directory)) != NULL && (size_t)found < pointers)
++	{
++		size_t length;
++
++		if (!strcmp(entry->d_name, ".") || !strcmp(entry->d_name, ".."))
++			continue;
++		if (pattern && !glob_match(pattern, entry->d_name, (flags & SDL_GLOB_CASEINSENSITIVE) != 0))
++			continue;
++		length = strlen(entry->d_name) + 1;
++		memcpy(strings, entry->d_name, length);
++		result[found++] = strings;
++		strings += length;
++	}
++	result[found] = NULL;
++	closedir(directory);
++	if (count)
++		*count = found;
++	return result;
++}
++
++/* no file dialog: the disc image goes in the data folder (sdl_platform.c's
++data_find_image finds it there) */
++void SDL_ShowOpenFileDialog(SDL_DialogFileCallback callback, void *userdata, SDL_Window *window,
++	const SDL_DialogFileFilter *filters, int nfilters, const char *default_location, bool allow_many)
++{
++	(void)window;
++	(void)filters;
++	(void)nfilters;
++	(void)default_location;
++	(void)allow_many;
++	callback(userdata, NULL, -1);
++}
+diff --git a/port/ps4/guest/libc/arch/x32_guest/atomic_arch.h b/port/ps4/guest/libc/arch/x32_guest/atomic_arch.h
+new file mode 100644
+index 00000000..37f1f534
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/atomic_arch.h
+@@ -0,0 +1,77 @@
++/* plain compiler atomics (as the Android guest's arm64_32 arch), with
++x86's pause while spinning */
++#define a_ll a_ll
++static inline int a_ll(volatile int *p)
++{
++	return __atomic_load_n(p, __ATOMIC_ACQUIRE);
++}
++
++#define a_cas a_cas
++static inline int a_cas(volatile int *p, int t, int s)
++{
++	__atomic_compare_exchange_n(p, &t, s, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++	return t;
++}
++
++#define a_cas_p a_cas_p
++static inline void *a_cas_p(volatile void *p, void *t, void *s)
++{
++	__atomic_compare_exchange_n((void *volatile *)p, &t, s, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
++	return t;
++}
++
++#define a_swap a_swap
++static inline int a_swap(volatile int *p, int v)
++{
++	return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST);
++}
++
++#define a_fetch_add a_fetch_add
++static inline int a_fetch_add(volatile int *p, int v)
++{
++	return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST);
++}
++
++#define a_fetch_and a_fetch_and
++static inline int a_fetch_and(volatile int *p, int v)
++{
++	return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST);
++}
++
++#define a_fetch_or a_fetch_or
++static inline int a_fetch_or(volatile int *p, int v)
++{
++	return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST);
++}
++
++#define a_barrier a_barrier
++static inline void a_barrier()
++{
++	__atomic_thread_fence(__ATOMIC_SEQ_CST);
++}
++
++#define a_spin a_spin
++static inline void a_spin()
++{
++	__builtin_ia32_pause();
++	/* a compiler barrier, as the "memory" clobber of an asm pause would be */
++	__atomic_signal_fence(__ATOMIC_SEQ_CST);
++}
++
++#define a_crash a_crash
++static inline void a_crash()
++{
++	__builtin_trap();
++}
++
++#define a_ctz_64 a_ctz_64
++static inline int a_ctz_64(uint64_t x)
++{
++	return __builtin_ctzll(x);
++}
++
++#define a_clz_64 a_clz_64
++static inline int a_clz_64(uint64_t x)
++{
++	return __builtin_clzll(x);
++}
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/alltypes.h.in b/port/ps4/guest/libc/arch/x32_guest/bits/alltypes.h.in
+new file mode 100644
+index 00000000..9c538e42
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/alltypes.h.in
+@@ -0,0 +1,32 @@
++/* x32_guest: x86-64 code with 32-bit pointers and longs (the PS4 port's
++guest ABI, see port/ps4/README.md); otherwise as the Android guest's
++arm64_32 */
++#define _Addr int
++#define _Int64 long long
++#define _Reg long long
++
++#define __BYTE_ORDER 1234
++#define __LONG_MAX 0x7fffffffL
++
++#ifndef __cplusplus
++#ifdef __WCHAR_TYPE__
++TYPEDEF __WCHAR_TYPE__ wchar_t;
++#else
++TYPEDEF unsigned short wchar_t;
++#endif
++#endif
++TYPEDEF unsigned wint_t;
++
++/* 32-bit, as in the MSVC runtime the game was written against (it keeps
++times in longs); the system call layer converts to the kernel's 64-bit
++structures */
++TYPEDEF long time_t;
++TYPEDEF long suseconds_t;
++
++TYPEDEF int blksize_t;
++TYPEDEF unsigned int nlink_t;
++
++TYPEDEF float float_t;
++TYPEDEF double double_t;
++
++TYPEDEF struct { long long __ll; long double __ld; } max_align_t;
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/fcntl.h b/port/ps4/guest/libc/arch/x32_guest/bits/fcntl.h
+new file mode 100644
+index 00000000..92787976
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/fcntl.h
+@@ -0,0 +1,38 @@
++#define O_CREAT        0100
++#define O_EXCL         0200
++#define O_NOCTTY       0400
++#define O_TRUNC       01000
++#define O_APPEND      02000
++#define O_NONBLOCK    04000
++#define O_DSYNC      010000
++#define O_SYNC     04010000
++#define O_RSYNC    04010000
++#define O_DIRECTORY  040000
++#define O_NOFOLLOW  0100000
++#define O_CLOEXEC  02000000
++
++#define O_ASYNC      020000
++#define O_DIRECT    0200000
++#define O_LARGEFILE 0400000
++#define O_NOATIME  01000000
++#define O_PATH    010000000
++#define O_TMPFILE 020040000
++#define O_NDELAY O_NONBLOCK
++
++#define F_DUPFD  0
++#define F_GETFD  1
++#define F_SETFD  2
++#define F_GETFL  3
++#define F_SETFL  4
++#define F_GETLK  5
++#define F_SETLK  6
++#define F_SETLKW 7
++#define F_SETOWN 8
++#define F_GETOWN 9
++#define F_SETSIG 10
++#define F_GETSIG 11
++
++#define F_SETOWN_EX 15
++#define F_GETOWN_EX 16
++
++#define F_GETOWNER_UIDS 17
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/fenv.h b/port/ps4/guest/libc/arch/x32_guest/bits/fenv.h
+new file mode 100644
+index 00000000..24df0417
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/fenv.h
+@@ -0,0 +1,34 @@
++#define FE_INVALID    1
++#define __FE_DENORM   2
++#define FE_DIVBYZERO  4
++#define FE_OVERFLOW   8
++#define FE_UNDERFLOW  16
++#define FE_INEXACT    32
++
++#define FE_ALL_EXCEPT 63
++
++#define FE_TONEAREST  0
++#define FE_DOWNWARD   0x400
++#define FE_UPWARD     0x800
++#define FE_TOWARDZERO 0xc00
++
++typedef unsigned short fexcept_t;
++
++typedef struct {
++	unsigned short __control_word;
++	unsigned short __unused1;
++	unsigned short __status_word;
++	unsigned short __unused2;
++	unsigned short __tags;
++	unsigned short __unused3;
++	unsigned int __eip;
++	unsigned short __cs_selector;
++	unsigned int __opcode:11;
++	unsigned int __unused4:5;
++	unsigned int __data_offset;
++	unsigned short __data_selector;
++	unsigned short __unused5;
++	unsigned int __mxcsr;
++} fenv_t;
++
++#define FE_DFL_ENV      ((const fenv_t *) -1)
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/float.h b/port/ps4/guest/libc/arch/x32_guest/bits/float.h
+new file mode 100644
+index 00000000..4d8e7864
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/float.h
+@@ -0,0 +1,20 @@
++#ifdef __FLT_EVAL_METHOD__
++#define FLT_EVAL_METHOD __FLT_EVAL_METHOD__
++#else
++#define FLT_EVAL_METHOD 0
++#endif
++
++#define LDBL_TRUE_MIN 3.6451995318824746025e-4951L
++#define LDBL_MIN     3.3621031431120935063e-4932L
++#define LDBL_MAX     1.1897314953572317650e+4932L
++#define LDBL_EPSILON 1.0842021724855044340e-19L
++
++#define LDBL_MANT_DIG 64
++#define LDBL_MIN_EXP (-16381)
++#define LDBL_MAX_EXP 16384
++
++#define LDBL_DIG 18
++#define LDBL_MIN_10_EXP (-4931)
++#define LDBL_MAX_10_EXP 4932
++
++#define DECIMAL_DIG 21
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/limits.h b/port/ps4/guest/libc/arch/x32_guest/bits/limits.h
+new file mode 100644
+index 00000000..a36926de
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/limits.h
+@@ -0,0 +1,2 @@
++#define PAGESIZE 4096
++#define LONG_BIT 32
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/mman.h b/port/ps4/guest/libc/arch/x32_guest/bits/mman.h
+new file mode 100644
+index 00000000..ba2d6f7a
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/mman.h
+@@ -0,0 +1 @@
++#define MAP_32BIT      0x40
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/posix.h b/port/ps4/guest/libc/arch/x32_guest/bits/posix.h
+new file mode 100644
+index 00000000..30a38714
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/posix.h
+@@ -0,0 +1,2 @@
++#define _POSIX_V6_ILP32_OFFBIG  1
++#define _POSIX_V7_ILP32_OFFBIG  1
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/reg.h b/port/ps4/guest/libc/arch/x32_guest/bits/reg.h
+new file mode 100644
+index 00000000..5faaef1a
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/reg.h
+@@ -0,0 +1,29 @@
++#undef __WORDSIZE
++#define __WORDSIZE 32
++#define R15    0
++#define R14    1
++#define R13    2
++#define R12    3
++#define RBP    4
++#define RBX    5
++#define R11    6
++#define R10    7
++#define R9     8
++#define R8     9
++#define RAX    10
++#define RCX    11
++#define RDX    12
++#define RSI    13
++#define RDI    14
++#define ORIG_RAX 15
++#define RIP    16
++#define CS     17
++#define EFLAGS 18
++#define RSP    19
++#define SS     20
++#define FS_BASE 21
++#define GS_BASE 22
++#define DS     23
++#define ES     24
++#define FS     25
++#define GS     26
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/setjmp.h b/port/ps4/guest/libc/arch/x32_guest/bits/setjmp.h
+new file mode 100644
+index 00000000..a9262a64
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/setjmp.h
+@@ -0,0 +1 @@
++typedef unsigned long long __jmp_buf[8];
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/signal.h b/port/ps4/guest/libc/arch/x32_guest/bits/signal.h
+new file mode 100644
+index 00000000..097be6f4
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/signal.h
+@@ -0,0 +1,153 @@
++#if defined(_POSIX_SOURCE) || defined(_POSIX_C_SOURCE) \
++ || defined(_XOPEN_SOURCE) || defined(_GNU_SOURCE) || defined(_BSD_SOURCE)
++
++#if defined(_XOPEN_SOURCE) || defined(_GNU_SOURCE) || defined(_BSD_SOURCE)
++#define MINSIGSTKSZ 2048
++#define SIGSTKSZ 8192
++#endif
++
++#ifdef _GNU_SOURCE
++enum { REG_R8 = 0 };
++#define REG_R8 REG_R8
++enum { REG_R9 = 1 };
++#define REG_R9 REG_R9
++enum { REG_R10 = 2 };
++#define REG_R10 REG_R10
++enum { REG_R11 = 3 };
++#define REG_R11 REG_R11
++enum { REG_R12 = 4 };
++#define REG_R12 REG_R12
++enum { REG_R13 = 5 };
++#define REG_R13 REG_R13
++enum { REG_R14 = 6 };
++#define REG_R14 REG_R14
++enum { REG_R15 = 7 };
++#define REG_R15 REG_R15
++enum { REG_RDI = 8 };
++#define REG_RDI REG_RDI
++enum { REG_RSI = 9 };
++#define REG_RSI REG_RSI
++enum { REG_RBP = 10 };
++#define REG_RBP REG_RBP
++enum { REG_RBX = 11 };
++#define REG_RBX REG_RBX
++enum { REG_RDX = 12 };
++#define REG_RDX REG_RDX
++enum { REG_RAX = 13 };
++#define REG_RAX REG_RAX
++enum { REG_RCX = 14 };
++#define REG_RCX REG_RCX
++enum { REG_RSP = 15 };
++#define REG_RSP REG_RSP
++enum { REG_RIP = 16 };
++#define REG_RIP REG_RIP
++enum { REG_EFL = 17 };
++#define REG_EFL REG_EFL
++enum { REG_CSGSFS = 18 };
++#define REG_CSGSFS REG_CSGSFS
++enum { REG_ERR = 19 };
++#define REG_ERR REG_ERR
++enum { REG_TRAPNO = 20 };
++#define REG_TRAPNO REG_TRAPNO
++enum { REG_OLDMASK = 21 };
++#define REG_OLDMASK REG_OLDMASK
++enum { REG_CR2 = 22 };
++#define REG_CR2 REG_CR2
++#endif
++
++#if defined(_GNU_SOURCE) || defined(_BSD_SOURCE)
++typedef long long greg_t, gregset_t[23];
++typedef struct _fpstate {
++	unsigned short cwd, swd, ftw, fop;
++	unsigned long long rip, rdp;
++	unsigned mxcsr, mxcr_mask;
++	struct {
++		unsigned short significand[4], exponent, padding[3];
++	} _st[8];
++	struct {
++		unsigned element[4];
++	} _xmm[16];
++	unsigned padding[24];
++} *fpregset_t;
++struct sigcontext {
++	unsigned long long r8, r9, r10, r11, r12, r13, r14, r15;
++	unsigned long long rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp, rip, eflags;
++	unsigned short cs, gs, fs, __pad0;
++	unsigned long long err, trapno, oldmask, cr2;
++	struct _fpstate *fpstate;
++	unsigned long long __reserved1[8];
++};
++typedef struct {
++	gregset_t gregs;
++	fpregset_t fpregs;
++	unsigned long long __reserved1[8];
++} mcontext_t;
++#else
++typedef struct {
++	unsigned long long __space[32];
++} mcontext_t;
++#endif
++
++struct sigaltstack {
++	void *ss_sp;
++	int ss_flags;
++	size_t ss_size;
++};
++
++typedef struct __ucontext {
++	unsigned long uc_flags;
++	struct __ucontext *uc_link;
++	stack_t uc_stack;
++	mcontext_t uc_mcontext;
++	sigset_t uc_sigmask;
++	unsigned long long __fpregs_mem[64];
++} ucontext_t;
++
++#define SA_NOCLDSTOP  1
++#define SA_NOCLDWAIT  2
++#define SA_SIGINFO    4
++#define SA_ONSTACK    0x08000000
++#define SA_RESTART    0x10000000
++#define SA_NODEFER    0x40000000
++#define SA_RESETHAND  0x80000000
++#define SA_RESTORER   0x04000000
++
++#endif
++
++#define SIGHUP    1
++#define SIGINT    2
++#define SIGQUIT   3
++#define SIGILL    4
++#define SIGTRAP   5
++#define SIGABRT   6
++#define SIGIOT    SIGABRT
++#define SIGBUS    7
++#define SIGFPE    8
++#define SIGKILL   9
++#define SIGUSR1   10
++#define SIGSEGV   11
++#define SIGUSR2   12
++#define SIGPIPE   13
++#define SIGALRM   14
++#define SIGTERM   15
++#define SIGSTKFLT 16
++#define SIGCHLD   17
++#define SIGCONT   18
++#define SIGSTOP   19
++#define SIGTSTP   20
++#define SIGTTIN   21
++#define SIGTTOU   22
++#define SIGURG    23
++#define SIGXCPU   24
++#define SIGXFSZ   25
++#define SIGVTALRM 26
++#define SIGPROF   27
++#define SIGWINCH  28
++#define SIGIO     29
++#define SIGPOLL   29
++#define SIGPWR    30
++#define SIGSYS    31
++#define SIGUNUSED SIGSYS
++
++#define _NSIG 65
++
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/stat.h b/port/ps4/guest/libc/arch/x32_guest/bits/stat.h
+new file mode 100644
+index 00000000..d403c746
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/stat.h
+@@ -0,0 +1,17 @@
++/* the guest's own layout (32-bit time_t); the system call layer converts
++from the kernel's */
++struct stat {
++	dev_t st_dev;
++	ino_t st_ino;
++	mode_t st_mode;
++	nlink_t st_nlink;
++	uid_t st_uid;
++	gid_t st_gid;
++	dev_t st_rdev;
++	off_t st_size;
++	blksize_t st_blksize;
++	blkcnt_t st_blocks;
++	struct timespec st_atim;
++	struct timespec st_mtim;
++	struct timespec st_ctim;
++};
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/stdint.h b/port/ps4/guest/libc/arch/x32_guest/bits/stdint.h
+new file mode 100644
+index 00000000..d1b27121
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/stdint.h
+@@ -0,0 +1,20 @@
++typedef int32_t int_fast16_t;
++typedef int32_t int_fast32_t;
++typedef uint32_t uint_fast16_t;
++typedef uint32_t uint_fast32_t;
++
++#define INT_FAST16_MIN  INT32_MIN
++#define INT_FAST32_MIN  INT32_MIN
++
++#define INT_FAST16_MAX  INT32_MAX
++#define INT_FAST32_MAX  INT32_MAX
++
++#define UINT_FAST16_MAX UINT32_MAX
++#define UINT_FAST32_MAX UINT32_MAX
++
++#define INTPTR_MIN      INT32_MIN
++#define INTPTR_MAX      INT32_MAX
++#define UINTPTR_MAX     UINT32_MAX
++#define PTRDIFF_MIN     INT32_MIN
++#define PTRDIFF_MAX     INT32_MAX
++#define SIZE_MAX        UINT32_MAX
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/syscall.h.in b/port/ps4/guest/libc/arch/x32_guest/bits/syscall.h.in
+new file mode 100644
+index 00000000..ea5a152a
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/syscall.h.in
+@@ -0,0 +1,307 @@
++#define __NR_io_setup 0
++#define __NR_io_destroy 1
++#define __NR_io_submit 2
++#define __NR_io_cancel 3
++#define __NR_io_getevents 4
++#define __NR_setxattr 5
++#define __NR_lsetxattr 6
++#define __NR_fsetxattr 7
++#define __NR_getxattr 8
++#define __NR_lgetxattr 9
++#define __NR_fgetxattr 10
++#define __NR_listxattr 11
++#define __NR_llistxattr 12
++#define __NR_flistxattr 13
++#define __NR_removexattr 14
++#define __NR_lremovexattr 15
++#define __NR_fremovexattr 16
++#define __NR_getcwd 17
++#define __NR_lookup_dcookie 18
++#define __NR_eventfd2 19
++#define __NR_epoll_create1 20
++#define __NR_epoll_ctl 21
++#define __NR_epoll_pwait 22
++#define __NR_dup 23
++#define __NR_dup3 24
++#define __NR_fcntl 25
++#define __NR_inotify_init1 26
++#define __NR_inotify_add_watch 27
++#define __NR_inotify_rm_watch 28
++#define __NR_ioctl 29
++#define __NR_ioprio_set 30
++#define __NR_ioprio_get 31
++#define __NR_flock 32
++#define __NR_mknodat 33
++#define __NR_mkdirat 34
++#define __NR_unlinkat 35
++#define __NR_symlinkat 36
++#define __NR_linkat 37
++#define __NR_renameat 38
++#define __NR_umount2 39
++#define __NR_mount 40
++#define __NR_pivot_root 41
++#define __NR_nfsservctl 42
++#define __NR_statfs 43
++#define __NR_fstatfs 44
++#define __NR_truncate 45
++#define __NR_ftruncate 46
++#define __NR_fallocate 47
++#define __NR_faccessat 48
++#define __NR_chdir 49
++#define __NR_fchdir 50
++#define __NR_chroot 51
++#define __NR_fchmod 52
++#define __NR_fchmodat 53
++#define __NR_fchownat 54
++#define __NR_fchown 55
++#define __NR_openat 56
++#define __NR_close 57
++#define __NR_vhangup 58
++#define __NR_pipe2 59
++#define __NR_quotactl 60
++#define __NR_getdents64 61
++#define __NR_lseek 62
++#define __NR_read 63
++#define __NR_write 64
++#define __NR_readv 65
++#define __NR_writev 66
++#define __NR_pread64 67
++#define __NR_pwrite64 68
++#define __NR_preadv 69
++#define __NR_pwritev 70
++#define __NR_sendfile 71
++#define __NR_pselect6 72
++#define __NR_ppoll 73
++#define __NR_signalfd4 74
++#define __NR_vmsplice 75
++#define __NR_splice 76
++#define __NR_tee 77
++#define __NR_readlinkat 78
++#define __NR_newfstatat 79
++#define __NR_fstat 80
++#define __NR_sync 81
++#define __NR_fsync 82
++#define __NR_fdatasync 83
++#define __NR_sync_file_range 84
++#define __NR_timerfd_create 85
++#define __NR_timerfd_settime 86
++#define __NR_timerfd_gettime 87
++#define __NR_utimensat 88
++#define __NR_acct 89
++#define __NR_capget 90
++#define __NR_capset 91
++#define __NR_personality 92
++#define __NR_exit 93
++#define __NR_exit_group 94
++#define __NR_waitid 95
++#define __NR_set_tid_address 96
++#define __NR_unshare 97
++#define __NR_futex 98
++#define __NR_set_robust_list 99
++#define __NR_get_robust_list 100
++#define __NR_nanosleep 101
++#define __NR_getitimer 102
++#define __NR_setitimer 103
++#define __NR_kexec_load 104
++#define __NR_init_module 105
++#define __NR_delete_module 106
++#define __NR_timer_create 107
++#define __NR_timer_gettime 108
++#define __NR_timer_getoverrun 109
++#define __NR_timer_settime 110
++#define __NR_timer_delete 111
++#define __NR_clock_settime 112
++#define __NR_clock_gettime 113
++#define __NR_clock_getres 114
++#define __NR_clock_nanosleep 115
++#define __NR_syslog 116
++#define __NR_ptrace 117
++#define __NR_sched_setparam 118
++#define __NR_sched_setscheduler 119
++#define __NR_sched_getscheduler 120
++#define __NR_sched_getparam 121
++#define __NR_sched_setaffinity 122
++#define __NR_sched_getaffinity 123
++#define __NR_sched_yield 124
++#define __NR_sched_get_priority_max 125
++#define __NR_sched_get_priority_min 126
++#define __NR_sched_rr_get_interval 127
++#define __NR_restart_syscall 128
++#define __NR_kill 129
++#define __NR_tkill 130
++#define __NR_tgkill 131
++#define __NR_sigaltstack 132
++#define __NR_rt_sigsuspend 133
++#define __NR_rt_sigaction 134
++#define __NR_rt_sigprocmask 135
++#define __NR_rt_sigpending 136
++#define __NR_rt_sigtimedwait 137
++#define __NR_rt_sigqueueinfo 138
++#define __NR_rt_sigreturn 139
++#define __NR_setpriority 140
++#define __NR_getpriority 141
++#define __NR_reboot 142
++#define __NR_setregid 143
++#define __NR_setgid 144
++#define __NR_setreuid 145
++#define __NR_setuid 146
++#define __NR_setresuid 147
++#define __NR_getresuid 148
++#define __NR_setresgid 149
++#define __NR_getresgid 150
++#define __NR_setfsuid 151
++#define __NR_setfsgid 152
++#define __NR_times 153
++#define __NR_setpgid 154
++#define __NR_getpgid 155
++#define __NR_getsid 156
++#define __NR_setsid 157
++#define __NR_getgroups 158
++#define __NR_setgroups 159
++#define __NR_uname 160
++#define __NR_sethostname 161
++#define __NR_setdomainname 162
++#define __NR_getrlimit 163
++#define __NR_setrlimit 164
++#define __NR_getrusage 165
++#define __NR_umask 166
++#define __NR_prctl 167
++#define __NR_getcpu 168
++#define __NR_gettimeofday 169
++#define __NR_settimeofday 170
++#define __NR_adjtimex 171
++#define __NR_getpid 172
++#define __NR_getppid 173
++#define __NR_getuid 174
++#define __NR_geteuid 175
++#define __NR_getgid 176
++#define __NR_getegid 177
++#define __NR_gettid 178
++#define __NR_sysinfo 179
++#define __NR_mq_open 180
++#define __NR_mq_unlink 181
++#define __NR_mq_timedsend 182
++#define __NR_mq_timedreceive 183
++#define __NR_mq_notify 184
++#define __NR_mq_getsetattr 185
++#define __NR_msgget 186
++#define __NR_msgctl 187
++#define __NR_msgrcv 188
++#define __NR_msgsnd 189
++#define __NR_semget 190
++#define __NR_semctl 191
++#define __NR_semtimedop 192
++#define __NR_semop 193
++#define __NR_shmget 194
++#define __NR_shmctl 195
++#define __NR_shmat 196
++#define __NR_shmdt 197
++#define __NR_socket 198
++#define __NR_socketpair 199
++#define __NR_bind 200
++#define __NR_listen 201
++#define __NR_accept 202
++#define __NR_connect 203
++#define __NR_getsockname 204
++#define __NR_getpeername 205
++#define __NR_sendto 206
++#define __NR_recvfrom 207
++#define __NR_setsockopt 208
++#define __NR_getsockopt 209
++#define __NR_shutdown 210
++#define __NR_sendmsg 211
++#define __NR_recvmsg 212
++#define __NR_readahead 213
++#define __NR_brk 214
++#define __NR_munmap 215
++#define __NR_mremap 216
++#define __NR_add_key 217
++#define __NR_request_key 218
++#define __NR_keyctl 219
++#define __NR_clone 220
++#define __NR_execve 221
++#define __NR_mmap 222
++#define __NR_fadvise64 223
++#define __NR_swapon 224
++#define __NR_swapoff 225
++#define __NR_mprotect 226
++#define __NR_msync 227
++#define __NR_mlock 228
++#define __NR_munlock 229
++#define __NR_mlockall 230
++#define __NR_munlockall 231
++#define __NR_mincore 232
++#define __NR_madvise 233
++#define __NR_remap_file_pages 234
++#define __NR_mbind 235
++#define __NR_get_mempolicy 236
++#define __NR_set_mempolicy 237
++#define __NR_migrate_pages 238
++#define __NR_move_pages 239
++#define __NR_rt_tgsigqueueinfo 240
++#define __NR_perf_event_open 241
++#define __NR_accept4 242
++#define __NR_recvmmsg 243
++#define __NR_wait4 260
++#define __NR_prlimit64 261
++#define __NR_fanotify_init 262
++#define __NR_fanotify_mark 263
++#define __NR_name_to_handle_at 264
++#define __NR_open_by_handle_at 265
++#define __NR_clock_adjtime 266
++#define __NR_syncfs 267
++#define __NR_setns 268
++#define __NR_sendmmsg 269
++#define __NR_process_vm_readv 270
++#define __NR_process_vm_writev 271
++#define __NR_kcmp 272
++#define __NR_finit_module 273
++#define __NR_sched_setattr 274
++#define __NR_sched_getattr 275
++#define __NR_renameat2 276
++#define __NR_seccomp 277
++#define __NR_getrandom 278
++#define __NR_memfd_create 279
++#define __NR_bpf 280
++#define __NR_execveat 281
++#define __NR_userfaultfd 282
++#define __NR_membarrier 283
++#define __NR_mlock2 284
++#define __NR_copy_file_range 285
++#define __NR_preadv2 286
++#define __NR_pwritev2 287
++#define __NR_pkey_mprotect 288
++#define __NR_pkey_alloc 289
++#define __NR_pkey_free 290
++#define __NR_statx 291
++#define __NR_io_pgetevents 292
++#define __NR_rseq 293
++#define __NR_kexec_file_load 294
++#define __NR_pidfd_send_signal 424
++#define __NR_io_uring_setup 425
++#define __NR_io_uring_enter 426
++#define __NR_io_uring_register 427
++#define __NR_open_tree		428
++#define __NR_move_mount		429
++#define __NR_fsopen		430
++#define __NR_fsconfig		431
++#define __NR_fsmount		432
++#define __NR_fspick		433
++#define __NR_pidfd_open		434
++#define __NR_clone3		435
++#define __NR_close_range	436
++#define __NR_openat2		437
++#define __NR_pidfd_getfd	438
++#define __NR_faccessat2		439
++#define __NR_process_madvise	440
++#define __NR_epoll_pwait2	441
++#define __NR_mount_setattr	442
++#define __NR_landlock_create_ruleset	444
++#define __NR_landlock_add_rule	445
++#define __NR_landlock_restrict_self	446
++#define __NR_process_mrelease	448
++#define __NR_futex_waitv	449
++#define __NR_set_mempolicy_home_node	450
++#define __NR_cachestat		451
++#define __NR_fchmodat2		452
++
+diff --git a/port/ps4/guest/libc/arch/x32_guest/bits/user.h b/port/ps4/guest/libc/arch/x32_guest/bits/user.h
+new file mode 100644
+index 00000000..eac82a14
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/bits/user.h
+@@ -0,0 +1,41 @@
++#undef __WORDSIZE
++#define __WORDSIZE 32
++
++typedef struct user_fpregs_struct {
++	uint16_t cwd, swd, ftw, fop;
++	uint64_t rip, rdp;
++	uint32_t mxcsr, mxcr_mask;
++	uint32_t st_space[32], xmm_space[64], padding[24];
++} elf_fpregset_t;
++
++struct user_regs_struct {
++	unsigned long r15, r14, r13, r12, rbp, rbx, r11, r10, r9, r8;
++	unsigned long rax, rcx, rdx, rsi, rdi, orig_rax, rip;
++	unsigned long cs, eflags, rsp, ss, fs_base, gs_base, ds, es, fs, gs;
++};
++#define ELF_NGREG 27
++typedef unsigned long long elf_greg_t, elf_gregset_t[ELF_NGREG];
++
++struct user {
++	struct user_regs_struct		regs;
++	int				u_fpvalid;
++	struct user_fpregs_struct	i387;
++	unsigned long			u_tsize;
++	unsigned long			u_dsize;
++	unsigned long			u_ssize;
++	unsigned long			start_code;
++	unsigned long			start_stack;
++	long				signal;
++	int				reserved;
++	struct user_regs_struct		*u_ar0;
++	struct user_fpregs_struct	*u_fpstate;
++	unsigned long			magic;
++	char				u_comm[32];
++	unsigned long			u_debugreg[8];
++};
++
++#define PAGE_MASK		(~(PAGESIZE-1))
++#define NBPG			PAGESIZE
++#define UPAGES			1
++#define HOST_TEXT_START_ADDR	(u.start_code)
++#define HOST_STACK_END_ADDR	(u.start_stack + u.u_ssize * NBPG)
+diff --git a/port/ps4/guest/libc/arch/x32_guest/crt_arch.h b/port/ps4/guest/libc/arch/x32_guest/crt_arch.h
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/port/ps4/guest/libc/arch/x32_guest/fp_arch.h b/port/ps4/guest/libc/arch/x32_guest/fp_arch.h
+new file mode 100644
+index 00000000..e69de29b
+diff --git a/port/ps4/guest/libc/arch/x32_guest/kstat.h b/port/ps4/guest/libc/arch/x32_guest/kstat.h
+new file mode 100644
+index 00000000..09f046fa
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/kstat.h
+@@ -0,0 +1,24 @@
++/* struct stat as the AArch64 kernel lays it out (fstat, newfstatat),
++spelled with fixed-width types: the PS4 host fills it from the system's
++(port/ps4/host/host_syscall.c) */
++struct kstat {
++	unsigned long long st_dev;
++	unsigned long long st_ino;
++	unsigned int st_mode;
++	unsigned int st_nlink;
++	unsigned int st_uid;
++	unsigned int st_gid;
++	unsigned long long st_rdev;
++	unsigned long long __pad;
++	long long st_size;
++	int st_blksize;
++	int __pad2;
++	long long st_blocks;
++	long long st_atime_sec;
++	long long st_atime_nsec;
++	long long st_mtime_sec;
++	long long st_mtime_nsec;
++	long long st_ctime_sec;
++	long long st_ctime_nsec;
++	unsigned int __unused[2];
++};
+diff --git a/port/ps4/guest/libc/arch/x32_guest/pthread_arch.h b/port/ps4/guest/libc/arch/x32_guest/pthread_arch.h
+new file mode 100644
+index 00000000..f2230bef
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/pthread_arch.h
+@@ -0,0 +1,11 @@
++/* The guest has no thread pointer register of its own (%fs belongs to the
++PS4's libkernel), so the runtime hands out each thread's struct pthread
++(port/android/guest/runtime/guest_thread.c). */
++uintptr_t __guest_get_tp(void);
++
++static inline uintptr_t __get_tp()
++{
++	return __guest_get_tp();
++}
++
++#define MC_PC gregs[REG_RIP]
+diff --git a/port/ps4/guest/libc/arch/x32_guest/reloc.h b/port/ps4/guest/libc/arch/x32_guest/reloc.h
+new file mode 100644
+index 00000000..f40b0980
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/reloc.h
+@@ -0,0 +1 @@
++#define LDSO_ARCH "x32"
+diff --git a/port/ps4/guest/libc/arch/x32_guest/syscall_arch.h b/port/ps4/guest/libc/arch/x32_guest/syscall_arch.h
+new file mode 100644
+index 00000000..c32df750
+--- /dev/null
++++ b/port/ps4/guest/libc/arch/x32_guest/syscall_arch.h
+@@ -0,0 +1,50 @@
++/* The guest cannot enter the kernel directly with its own structure
++layouts, so every system call musl makes goes to the runtime's dispatcher
++(port/android/guest/runtime/guest_syscall.c), which performs it through
++the host. The numbers are the generic Linux ones (bits/syscall.h.in, as
++AArch64's), which the PS4 host translates (port/ps4/host/host_syscall.c). */
++#define __SYSCALL_LL_E(x) (x)
++#define __SYSCALL_LL_O(x) (x)
++
++#define __scc(X) sizeof(1?(X):0ULL) < 8 ? (unsigned long) (X) : (long long) (X)
++typedef long long syscall_arg_t;
++
++long __guest_syscall(long long, long long, long long, long long, long long, long long, long long);
++
++static __inline long __syscall0(long long n)
++{
++	return __guest_syscall(n, 0, 0, 0, 0, 0, 0);
++}
++
++static __inline long __syscall1(long long n, long long a)
++{
++	return __guest_syscall(n, a, 0, 0, 0, 0, 0);
++}
++
++static __inline long __syscall2(long long n, long long a, long long b)
++{
++	return __guest_syscall(n, a, b, 0, 0, 0, 0);
++}
++
++static __inline long __syscall3(long long n, long long a, long long b, long long c)
++{
++	return __guest_syscall(n, a, b, c, 0, 0, 0);
++}
++
++static __inline long __syscall4(long long n, long long a, long long b, long long c, long long d)
++{
++	return __guest_syscall(n, a, b, c, d, 0, 0);
++}
++
++static __inline long __syscall5(long long n, long long a, long long b, long long c, long long d, long long e)
++{
++	return __guest_syscall(n, a, b, c, d, e, 0);
++}
++
++static __inline long __syscall6(long long n, long long a, long long b, long long c, long long d, long long e, long long f)
++{
++	return __guest_syscall(n, a, b, c, d, e, f);
++}
++
++#define SYSCALL_NO_TLS 1
++#define IPC_64 0
+diff --git a/port/ps4/host/host.h b/port/ps4/host/host.h
+new file mode 100644
+index 00000000..8da3d8bb
+--- /dev/null
++++ b/port/ps4/host/host.h
+@@ -0,0 +1,136 @@
++/*
++HOST.H
++
++Internals of the PS4 port's host (the eboot). See port/ps4/README.md for the
++design and port/android/include/halo_android_abi.h for the guest contract,
++which the PS4's x32 guest shares with Android's.
++*/
++
++#ifndef __HALO_PS4_HOST_H
++#define __HALO_PS4_HOST_H
++
++#include <stdarg.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdio.h>
++
++#include "halo_android_abi.h"
++
++/* the package's version (set by the build) */
++#ifndef OPENCE_PS4_VERSION
++#define OPENCE_PS4_VERSION "00.00"
++#endif
++
++/* ---------- where the game keeps its files */
++
++#define HOST_DATA_ROOT "/data/OpenCE"
++#define HOST_SAVE_ROOT HOST_DATA_ROOT "/save"
++/* the guest image and the files beside it in the package */
++#define HOST_PACKAGE_ROOT "/app0"
++
++/* ---------- logging (HOST_DATA_ROOT/host.log) */
++
++void host_logf(int priority, const char *format, ...) __attribute__((format(printf, 2, 3)));
++#define HOST_LOG_INFO 4
++#define HOST_LOG_WARN 5
++#define HOST_LOG_ERROR 6
++void host_log(int priority, const char *text);
++/* guest services also used inside the host */
++void host_exit(int code) __attribute__((noreturn));
++void host_abort(const char *reason) __attribute__((noreturn));
++int host_errno(void);
++
++/* logs and terminates */
++void host_fatal(const char *format, ...) __attribute__((format(printf, 1, 2), noreturn));
++
++/* port/ps4_crashlog.cpp: a startup milestone in boot-trace.log */
++void ps4_boot_trace(const char *stage);
++
++/* ---------- guest memory (host_memory.c)
++
++All memory the guest can address lies below 4 GB: the Xbox window and the
++image at their fixed addresses, and pools for everything else (the guest's
++malloc arenas, thread stacks, anonymous mappings). The PS4 has no demand-zero
++anonymous memory to speak of (flexible memory is a few hundred MB): the
++guest's memory is direct memory, mapped in 64 KB chunks when handed out. */
++
++/* reserves the fixed ranges and the pools' address space; returns 0 on
++success */
++int host_memory_initialize(void);
++/* maps the image's range [base, base + size): its first code_size bytes
++(the code and the read-only data) readable, writable and executable, the rest
++writable; returns 0 on success */
++int host_memory_map_image(uint32_t base, uint32_t code_size, uint32_t size);
++/* lists the mappings below 4 GB in the log */
++void host_memory_report_low_mappings(void);
++/* write tracking by page contents instead of page faults (host_watch_hash.h);
++call before the guest starts */
++void host_memory_watch_use_hashes(void);
++/* page-granular allocations below 4 GB, zeroed; NULL on failure */
++void *host_low_map(size_t size, int protection);
++void host_low_unmap(void *address, size_t size);
++/* 1 if [address, address + size) was handed out by host_low_map or is one of
++the fixed ranges */
++int host_low_owns(uintptr_t address, size_t size);
++/* the guest's mmap/munmap/mprotect (host_syscall.c), Linux flags and errors */
++long host_guest_mmap(uint64_t address, uint64_t size, int protection, int flags, int fd, int64_t offset);
++long host_guest_munmap(uint64_t address, uint64_t size);
++long host_guest_mprotect(uint64_t address, uint64_t size, int protection);
++/* makes watched pages in [address, address + size) writable before the
++host (or a system call) writes there: the kernel's copies fail with EFAULT
++on protected pages instead of faulting */
++void host_memory_prepare_write(uint64_t address, uint64_t size);
++/* the fault handlers (crash reports for everything else) */
++void host_install_signal_handlers(void);
++/* direct memory still free, in bytes */
++uint64_t host_direct_memory_free(void);
++
++/* ---------- the guest image (host_loader.c) */
++
++struct host_guest_image
++{
++	const struct halo_guest_header *header;
++	uint32_t base, end;
++};
++
++extern struct host_guest_image host_image;
++
++/* maps the image from the ELF file in memory; returns 0 on success */
++int host_load_image(const void *elf, size_t size);
++
++/* ---------- entering guest code (host_thread.c) */
++
++/* calls the guest function at address with up to four 32-bit arguments on
++this thread, which must have been made by host_native_thread_create (giving
++the thread a guest struct pthread first if it has none); returns the guest's
++eax */
++uint32_t host_call_guest(uint32_t function, uint32_t a, uint32_t b, uint32_t c, uint32_t d);
++/* starts a thread running function(argument) with its stack in guest
++memory, so that it can call guest code; the stack is freed after it exits.
++Returns 0 or an errno value */
++int host_native_thread_create(void *(*function)(void *), void *argument, size_t stack_size, const char *name);
++/* runs the guest's __guest_start on the calling thread (one made by
++host_native_thread_create); does not return */
++void host_run_guest_main(uint32_t boot) __attribute__((noreturn));
++/* this thread's small id, the guest's gettid() */
++int host_thread_id(void);
++
++/* ---------- the import table (generated: build/ps4/host/host_import_table.c) */
++
++void *host_resolve_import(const char *name);
++
++/* ---------- SDL and OpenGL (host_sdl.c, host_gl.c) */
++
++void *host_gl_resolve(const char *name);
++/* the swapchain's size (VideoOut's 1080p) */
++#define HOST_SCREEN_WIDTH 1920
++#define HOST_SCREEN_HEIGHT 1080
++/* reads the pads once a frame (host_sdl.c), from the frame's swap */
++void host_sdl_frame(void);
++
++/* ---------- debugging (host_debug.c) */
++
++void host_debug_thread_started(const char *name);
++void host_debug_thread_exited(void);
++
++#endif
+diff --git a/port/ps4/host/host_debug.c b/port/ps4/host/host_debug.c
+new file mode 100644
+index 00000000..8fe95841
+--- /dev/null
++++ b/port/ps4/host/host_debug.c
+@@ -0,0 +1,69 @@
++/*
++HOST_DEBUG.C
++
++Fault reports for the PS4 port: a fault that is not the write tracking's
++(host_memory.c) is written to the log with the registers and the guest's
++frame chain, before the crash handler of the PS4 runtime (crash.log) takes
++over. Guest addresses are the image's own: symbolize them with
++llvm-symbolizer --obj=build/ps4/halo_guest.elf.
++*/
++
++#include "host.h"
++
++#include <signal.h>
++#include <string.h>
++#include <ucontext.h>
++
++static __thread const char *thread_name;
++
++void host_debug_thread_started(const char *name)
++{
++	thread_name = name;
++}
++
++void host_debug_thread_exited(void)
++{
++	thread_name = NULL;
++}
++
++static int in_image(uint64_t address)
++{
++	return address >= host_image.base && address < host_image.end;
++}
++
++void host_debug_report_fault(int signal_number, siginfo_t *information, void *context)
++{
++	const ucontext_t *ucontext = context;
++	const mcontext_t *registers = &ucontext->uc_mcontext;
++	uint64_t rip = (uint64_t)registers->mc_rip, rbp = (uint64_t)registers->mc_rbp;
++	int index;
++
++	host_logf(HOST_LOG_ERROR, "signal %d at address %p on thread %s: rip %016llx rsp %016llx rbp %016llx%s",
++		signal_number, information->si_addr, thread_name ? thread_name : "?", (unsigned long long)rip,
++		(unsigned long long)registers->mc_rsp, (unsigned long long)rbp,
++		in_image(rip) ? " (in the game: llvm-symbolizer --obj=halo_guest.elf)" : "");
++	host_logf(HOST_LOG_ERROR, "  rax %016llx rbx %016llx rcx %016llx rdx %016llx",
++		(unsigned long long)registers->mc_rax, (unsigned long long)registers->mc_rbx,
++		(unsigned long long)registers->mc_rcx, (unsigned long long)registers->mc_rdx);
++	host_logf(HOST_LOG_ERROR, "  rsi %016llx rdi %016llx r8  %016llx r9  %016llx",
++		(unsigned long long)registers->mc_rsi, (unsigned long long)registers->mc_rdi,
++		(unsigned long long)registers->mc_r8, (unsigned long long)registers->mc_r9);
++	host_logf(HOST_LOG_ERROR, "  r10 %016llx r11 %016llx r12 %016llx r13 %016llx",
++		(unsigned long long)registers->mc_r10, (unsigned long long)registers->mc_r11,
++		(unsigned long long)registers->mc_r12, (unsigned long long)registers->mc_r13);
++	host_logf(HOST_LOG_ERROR, "  r14 %016llx r15 %016llx err %llx",
++		(unsigned long long)registers->mc_r14, (unsigned long long)registers->mc_r15,
++		(unsigned long long)registers->mc_err);
++	/* the guest's frame records: the caller's rbp and the return address,
++	8 bytes each (x32 pushes them as 64-bit values) */
++	for (index = 0; index < 24 && rbp && rbp < 0x100000000ULL && (rbp & 7) == 0; index++)
++	{
++		const uint64_t *frame = (const uint64_t *)(uintptr_t)rbp;
++
++		if (!host_low_owns(rbp, 16))
++			break;
++		host_logf(HOST_LOG_ERROR, "  frame %2d: return %016llx%s", index, (unsigned long long)frame[1],
++			in_image(frame[1]) ? " (game)" : "");
++		rbp = frame[0];
++	}
++}
+diff --git a/port/ps4/host/host_gl.c b/port/ps4/host/host_gl.c
+new file mode 100644
+index 00000000..31d9dd4d
+--- /dev/null
++++ b/port/ps4/host/host_gl.c
+@@ -0,0 +1,115 @@
++/*
++HOST_GL.C
++
++OpenGL ES for the guest, on the PS4: Mesa's, Zink on RADV, linked into the
++eboot (frontends/ps4 in the PS4 Mesa). The guest's generated entry points
++(guest_gl.c) import hostgl_<function>, resolved here to Mesa's dispatch
++functions (looked up by name: its public entry points miss some of OpenGL
++ES's); the arguments already have host types by then. The helpers are Android's
++(port/android/host/host_gl.c).
++*/
++
++#include "host.h"
++
++#include <GLES3/gl32.h>
++#include <string.h>
++
++#include "ps4_gl.h"
++
++void *host_gl_resolve(const char *name)
++{
++	/* the base-vertex extensions' entry points are the core function's */
++	if (!strcmp(name, "glDrawElementsBaseVertexEXT") || !strcmp(name, "glDrawElementsBaseVertexOES"))
++		name = "glDrawElementsBaseVertex";
++	return ps4gl_get_proc_address(name);
++}
++
++void host_gl_get_string(uint32_t name, int index, char *buffer, uint32_t size)
++{
++	const GLubyte *text = index >= 0 ? glGetStringi(name, (GLuint)index) : glGetString(name);
++
++	if (!size)
++		return;
++	buffer[0] = 0;
++	if (text)
++	{
++		strncpy(buffer, (const char *)text, size - 1);
++		buffer[size - 1] = 0;
++	}
++}
++
++int host_gl_has_extension(const char *name)
++{
++	GLint count = 0, index;
++
++	glGetIntegerv(GL_NUM_EXTENSIONS, &count);
++	for (index = 0; index < count; index++)
++	{
++		const char *extension = (const char *)glGetStringi(GL_EXTENSIONS, (GLuint)index);
++
++		if (extension && !strcmp(extension, name))
++			return 1;
++	}
++	return 0;
++}
++
++/* copies size bytes of a buffer object (the snapshots of the visibility
++tests' counters, d3d8_gl.c) */
++void host_gl_read_buffer(uint32_t buffer, uint32_t offset, uint32_t size, void *data)
++{
++	const void *mapping;
++
++	host_memory_prepare_write((uint64_t)(uintptr_t)data, size);
++	glBindBuffer(GL_COPY_READ_BUFFER, buffer);
++	mapping = glMapBufferRange(GL_COPY_READ_BUFFER, offset, size, GL_MAP_READ_BIT);
++	if (mapping)
++	{
++		memcpy(data, mapping, size);
++		glUnmapBuffer(GL_COPY_READ_BUFFER);
++	}
++	else
++	{
++		memset(data, 0, size);
++	}
++	glBindBuffer(GL_COPY_READ_BUFFER, 0);
++}
++
++/* a ring of fences, one for each frame's streamed vertices and indices
++(as Android's) */
++#define FRAME_FENCE_SLOTS 8
++
++static GLsync frame_fences[FRAME_FENCE_SLOTS];
++
++void host_gl_fence_frame(uint32_t slot)
++{
++	if (slot >= FRAME_FENCE_SLOTS)
++		return;
++	if (frame_fences[slot])
++		glDeleteSync(frame_fences[slot]);
++	frame_fences[slot] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
++}
++
++void host_gl_wait_frame(uint32_t slot)
++{
++	if (slot >= FRAME_FENCE_SLOTS || !frame_fences[slot])
++		return;
++	/* at most a second: a lost device must not hang the game */
++	glClientWaitSync(frame_fences[slot], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull);
++	glDeleteSync(frame_fences[slot]);
++	frame_fences[slot] = NULL;
++}
++
++/* an unsynchronized write into the buffer bound to target (as Android's: no
++GL_MAP_INVALIDATE_RANGE_BIT, whose cost per call was ruinous on Adreno) */
++void host_gl_buffer_write(uint32_t target, uint32_t offset, uint32_t size, const void *data)
++{
++	void *mapping = glMapBufferRange(target, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
++
++	if (!mapping)
++	{
++		glBufferSubData(target, offset, size, data);
++		return;
++	}
++	memcpy(mapping, data, size);
++	glUnmapBuffer(target);
++}
+diff --git a/port/ps4/host/host_loader.c b/port/ps4/host/host_loader.c
+new file mode 100644
+index 00000000..2afb1a74
+--- /dev/null
++++ b/port/ps4/host/host_loader.c
+@@ -0,0 +1,151 @@
++/*
++HOST_LOADER.C
++
++Loads the guest image: a statically linked x32 ELF executable (ELFCLASS32,
++x86-64 code, built by tools/ps4_build.py) whose segments are copied to the
++addresses it was linked at, below 4 GB, in memory the PS4 lets an app run
++code from (host_memory_map_image). The image starts with a struct
++halo_guest_header naming its import table, which is filled with the host
++functions of the same names. (Android's host_loader.c, for this ELF class.)
++*/
++
++#include "host.h"
++
++#include <string.h>
++
++/* (spelled out: the PS4's headers have no 32-bit ELF types) */
++struct elf32_header
++{
++	unsigned char ident[16];
++	uint16_t type;
++	uint16_t machine;
++	uint32_t version;
++	uint32_t entry;
++	uint32_t program_header_offset;
++	uint32_t section_header_offset;
++	uint32_t flags;
++	uint16_t header_size;
++	uint16_t program_header_size;
++	uint16_t program_header_count;
++	uint16_t section_header_size;
++	uint16_t section_header_count;
++	uint16_t section_names_index;
++};
++
++struct elf32_program_header
++{
++	uint32_t type;
++	uint32_t offset;
++	uint32_t virtual_address;
++	uint32_t physical_address;
++	uint32_t file_size;
++	uint32_t memory_size;
++	uint32_t flags;
++	uint32_t alignment;
++};
++
++#define ELF_CLASS_32 1
++#define ELF_TYPE_EXECUTABLE 2
++#define ELF_MACHINE_X86_64 62
++#define ELF_SEGMENT_LOAD 1
++#define ELF_SEGMENT_EXECUTABLE 1
++#define ELF_SEGMENT_WRITABLE 2
++
++struct host_guest_image host_image;
++
++static void missing_import(void)
++{
++	host_fatal("the guest called a host function that is not available");
++}
++
++int host_load_image(const void *file, size_t size)
++{
++	const struct elf32_header *elf = file;
++	const struct elf32_program_header *segments;
++	uint64_t low = ~0ULL, high = 0;
++	uint64_t code_end = 0;
++	const struct halo_guest_header *header;
++	uint64_t *table;
++	const char *name;
++	uint32_t count, index;
++	int missing = 0;
++
++	if (size < sizeof(*elf) || memcmp(elf->ident, "\177ELF", 4) || elf->ident[4] != ELF_CLASS_32 ||
++		elf->machine != ELF_MACHINE_X86_64 || elf->type != ELF_TYPE_EXECUTABLE ||
++		(uint64_t)elf->program_header_offset + (uint64_t)elf->program_header_count * sizeof(*segments) > size)
++	{
++		host_logf(HOST_LOG_ERROR, "the guest image is not an x32 executable");
++		return -1;
++	}
++	segments = (const struct elf32_program_header *)((const char *)file + elf->program_header_offset);
++	for (index = 0; index < elf->program_header_count; index++)
++	{
++		if (segments[index].type != ELF_SEGMENT_LOAD)
++			continue;
++		if (segments[index].virtual_address < low)
++			low = segments[index].virtual_address;
++		if ((uint64_t)segments[index].virtual_address + segments[index].memory_size > high)
++			high = (uint64_t)segments[index].virtual_address + segments[index].memory_size;
++		/* the code and read-only data come first (port/ps4/guest/guest.ld),
++		then the writable data at a 64 KB boundary */
++		if (segments[index].flags & ELF_SEGMENT_EXECUTABLE || !(segments[index].flags & ELF_SEGMENT_WRITABLE) ||
++			segments[index].virtual_address == HALO_GUEST_IMAGE_BASE)
++		{
++			uint64_t end = (uint64_t)segments[index].virtual_address + segments[index].memory_size;
++
++			if (end > code_end)
++				code_end = end;
++		}
++	}
++	low &= ~0xfffULL;
++	high = (high + 0xfff) & ~0xfffULL;
++	if (low != HALO_GUEST_IMAGE_BASE || high > 0x100000000ULL)
++	{
++		host_logf(HOST_LOG_ERROR, "the guest image spans %llx-%llx", (unsigned long long)low, (unsigned long long)high);
++		return -1;
++	}
++	if (host_memory_map_image((uint32_t)low, (uint32_t)(code_end - low), (uint32_t)(high - low)) != 0)
++		return -1;
++	for (index = 0; index < elf->program_header_count; index++)
++	{
++		const struct elf32_program_header *segment = &segments[index];
++
++		if (segment->type != ELF_SEGMENT_LOAD)
++			continue;
++		if ((uint64_t)segment->offset + segment->file_size > size)
++			return -1;
++		memcpy((void *)(uintptr_t)segment->virtual_address, (const char *)file + segment->offset, segment->file_size);
++	}
++
++	header = (const struct halo_guest_header *)(uintptr_t)low;
++	if (header->magic != HALO_GUEST_MAGIC || header->abi_version != HALO_GUEST_ABI_VERSION)
++	{
++		host_logf(HOST_LOG_ERROR, "the guest image header does not match this host");
++		return -1;
++	}
++	host_image.header = header;
++	host_image.base = (uint32_t)low;
++	host_image.end = (uint32_t)high;
++
++	table = (uint64_t *)(uintptr_t)header->import_table;
++	name = (const char *)(uintptr_t)header->import_names;
++	count = *(const uint32_t *)(uintptr_t)header->import_count;
++	for (index = 0; index < count; index++)
++	{
++		void *function = host_resolve_import(name);
++
++		if (!function && !strncmp(name, "hostgl_", 7))
++			function = host_gl_resolve(name + 7);
++		if (!function)
++		{
++			host_logf(HOST_LOG_WARN, "guest import %s is not available", name);
++			function = (void *)missing_import;
++			missing++;
++		}
++		table[index] = (uint64_t)(uintptr_t)function;
++		name += strlen(name) + 1;
++	}
++	host_logf(HOST_LOG_INFO, "guest image %08llx-%08llx, %u imports (%d unavailable)",
++		(unsigned long long)low, (unsigned long long)high, count, missing);
++	return 0;
++}
+diff --git a/port/ps4/host/host_main.c b/port/ps4/host/host_main.c
+new file mode 100644
+index 00000000..b6564084
+--- /dev/null
++++ b/port/ps4/host/host_main.c
+@@ -0,0 +1,327 @@
++/*
++HOST_MAIN.C
++
++Entry point of the PS4 port (the eboot's main).
++
++It reserves the guest's memory below 4 GB, loads the guest image (the game,
++built as x32 code) from the package, gives it an environment describing
++where the game data and saves live, and runs its main() on a thread of its
++own with its stack in guest memory (host_thread.c). The main thread then
++only waits: the game ends the process itself (host_exit).
++
++Storage: the game data (the folder holding maps/) and the settings
++(config.toml) are in /data/OpenCE; saves in its save/ folder. A disc image
++(.iso) put there is extracted to maps/ at the first start (the platform
++layer's own extraction, port/linux/src/xiso.c).
++*/
++
++#include "host.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdarg.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++int32_t ps4_usleep(uint32_t microseconds) __asm__("sceKernelUsleep");
++
++/* ---------- logging and termination */
++
++static int log_file = -1;
++static pthread_mutex_t log_file_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void log_write(int priority, const char *text)
++{
++	char line[1200];
++	struct timespec now;
++	int length;
++
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	length = snprintf(line, sizeof(line), "%5ld.%03ld %s %s\n", (long)now.tv_sec, now.tv_nsec / 1000000L,
++		priority >= HOST_LOG_ERROR ? "E" : priority >= HOST_LOG_WARN ? "W" : "I", text);
++	if (length < 0)
++		return;
++	if (length > (int)sizeof(line) - 1)
++		length = (int)sizeof(line) - 1;
++	pthread_mutex_lock(&log_file_lock);
++	if (log_file < 0)
++	{
++		mkdir(HOST_DATA_ROOT, 0777);
++		log_file = open(HOST_DATA_ROOT "/opence.log", O_WRONLY | O_CREAT | O_TRUNC, 0666);
++	}
++	if (log_file >= 0)
++		write(log_file, line, (size_t)length);
++	pthread_mutex_unlock(&log_file_lock);
++}
++
++void host_log(int priority, const char *text)
++{
++	log_write(priority, text ? text : "");
++}
++
++void host_logf(int priority, const char *format, ...)
++{
++	char message[1024];
++	va_list arguments;
++
++	va_start(arguments, format);
++	vsnprintf(message, sizeof(message), format, arguments);
++	va_end(arguments);
++	log_write(priority, message);
++}
++
++void host_fatal(const char *format, ...)
++{
++	char message[1024];
++	va_list arguments;
++
++	va_start(arguments, format);
++	vsnprintf(message, sizeof(message), format, arguments);
++	va_end(arguments);
++	log_write(HOST_LOG_ERROR, message);
++	ps4_boot_trace(message);
++	_exit(1);
++}
++
++void host_abort(const char *reason)
++{
++	host_logf(HOST_LOG_ERROR, "guest abort: %s", reason);
++	ps4_boot_trace(reason);
++	abort();
++}
++
++void host_exit(int code)
++{
++	host_logf(HOST_LOG_INFO, "the game exited (%d)", code);
++	ps4_boot_trace("the game exited");
++	_exit(code);
++}
++
++int host_errno(void)
++{
++	return errno;
++}
++
++/* ---------- the guest's environment */
++
++#define ENVIRONMENT_MAXIMUM 64
++
++struct environment
++{
++	char *entries[ENVIRONMENT_MAXIMUM];
++	int count;
++};
++
++static void environment_set(struct environment *environment, const char *name, const char *value)
++{
++	size_t length = strlen(name);
++	char *entry = malloc(length + strlen(value) + 2);
++	int index;
++
++	sprintf(entry, "%s=%s", name, value);
++	for (index = 0; index < environment->count; index++)
++	{
++		if (!strncmp(environment->entries[index], name, length) && environment->entries[index][length] == '=')
++		{
++			free(environment->entries[index]);
++			environment->entries[index] = entry;
++			return;
++		}
++	}
++	if (environment->count < ENVIRONMENT_MAXIMUM)
++		environment->entries[environment->count++] = entry;
++	else
++		free(entry);
++}
++
++/* environment.txt in the data folder: NAME=value lines for the game's
++settings' environment variables (port/linux/README.md), for tests */
++static void environment_file(struct environment *environment)
++{
++	FILE *file = fopen(HOST_DATA_ROOT "/environment.txt", "r");
++	char line[512];
++
++	if (!file)
++		return;
++	while (fgets(line, sizeof(line), file))
++	{
++		char *equals = strchr(line, '=');
++		size_t length = strlen(line);
++
++		while (length && (line[length - 1] == '\n' || line[length - 1] == '\r'))
++			line[--length] = 0;
++		if (!equals || line[0] == '#')
++			continue;
++		*equals = 0;
++		environment_set(environment, line, equals + 1);
++		host_logf(HOST_LOG_INFO, "environment.txt: %s=%s", line, equals + 1);
++	}
++	fclose(file);
++}
++
++/* copies argv and the environment into guest memory */
++static uint32_t make_boot(const struct environment *environment)
++{
++	size_t size = 0x10000;
++	char *memory = host_low_map(size, 3);
++	struct halo_guest_boot *boot = (struct halo_guest_boot *)memory;
++	uint32_t *argv = (uint32_t *)(memory + sizeof(*boot));
++	uint32_t *environ_list = argv + 2;
++	char *strings = (char *)(environ_list + ENVIRONMENT_MAXIMUM + 1);
++	int index;
++
++	if (!memory)
++		host_fatal("cannot allocate the guest's environment");
++	strcpy(strings, HOST_DATA_ROOT "/halo");
++	argv[0] = (uint32_t)(uintptr_t)strings;
++	argv[1] = 0;
++	strings += strlen(strings) + 1;
++	for (index = 0; index < environment->count; index++)
++	{
++		size_t length = strlen(environment->entries[index]) + 1;
++
++		if (strings + length > memory + size)
++			break;
++		memcpy(strings, environment->entries[index], length);
++		environ_list[index] = (uint32_t)(uintptr_t)strings;
++		strings += length;
++	}
++	environ_list[index] = 0;
++	boot->argc = 1;
++	boot->argv = (uint32_t)(uintptr_t)argv;
++	boot->environment = (uint32_t)(uintptr_t)environ_list;
++	/* the PS4's pages, which musl's allocator then rounds its mappings to */
++	boot->page_size = 0x4000;
++	return (uint32_t)(uintptr_t)boot;
++}
++
++static void *read_file(const char *path, size_t *size)
++{
++	int fd = open(path, O_RDONLY);
++	struct stat information;
++	char *data;
++	size_t done = 0;
++
++	if (fd < 0)
++		return NULL;
++	if (fstat(fd, &information) != 0 || information.st_size <= 0)
++	{
++		close(fd);
++		return NULL;
++	}
++	data = malloc((size_t)information.st_size);
++	while (data && done < (size_t)information.st_size)
++	{
++		ssize_t got = read(fd, data + done, (size_t)information.st_size - done);
++
++		if (got <= 0)
++		{
++			free(data);
++			data = NULL;
++			break;
++		}
++		done += (size_t)got;
++	}
++	close(fd);
++	*size = done;
++	return data;
++}
++
++/* copies a file of the package beside the data (the internet play's
++brokers) */
++static void copy_file(const char *from, const char *to)
++{
++	size_t size = 0;
++	void *data = read_file(from, &size);
++	int fd;
++
++	if (!data)
++		return;
++	fd = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0666);
++	if (fd >= 0)
++	{
++		write(fd, data, size);
++		close(fd);
++	}
++	free(data);
++}
++
++/* POSIX TZ for the console's offset (the guest's musl has no zone database) */
++static void time_zone(char *buffer, size_t size)
++{
++	time_t now = time(NULL);
++	struct tm local, universal;
++	long offset;
++
++	localtime_r(&now, &local);
++	gmtime_r(&now, &universal);
++	offset = -(long)difftime(mktime(&local), mktime(&universal));
++	snprintf(buffer, size, "<L>%s%ld:%02ld", offset < 0 ? "-" : "", labs(offset) / 3600, (labs(offset) / 60) % 60);
++}
++
++/* ---------- main */
++
++#define MAIN_STACK_SIZE (16 * 1024 * 1024)
++
++static void *game_main(void *unused)
++{
++	struct environment environment = { { 0 }, 0 };
++	char zone[64];
++	size_t image_size = 0;
++	void *image;
++	struct stat information;
++
++	(void)unused;
++	mkdir(HOST_DATA_ROOT, 0777);
++	mkdir(HOST_SAVE_ROOT, 0777);
++	environment_set(&environment, "HOME", HOST_SAVE_ROOT);
++	environment_set(&environment, "HALO_DATA_ROOT", HOST_DATA_ROOT);
++	environment_set(&environment, "HALO_SAVE_ROOT", HOST_SAVE_ROOT);
++	/* 480 lines in the TV's 16:9 shape (d3d8_gl.c), as Android does for its
++	display */
++	environment_set(&environment, "HALO_DISPLAY_WIDTH", "854");
++	time_zone(zone, sizeof(zone));
++	environment_set(&environment, "TZ", zone);
++	environment_file(&environment);
++	copy_file(HOST_PACKAGE_ROOT "/brokers.txt", HOST_DATA_ROOT "/brokers.txt");
++	if (stat(HOST_DATA_ROOT "/maps/ui.map", &information) != 0)
++		host_logf(HOST_LOG_INFO, "no maps in %s yet: a disc image (.iso) there is extracted", HOST_DATA_ROOT);
++
++	ps4_boot_trace("loading the game image");
++	image = read_file(HOST_PACKAGE_ROOT "/halo_guest.elf", &image_size);
++	if (!image)
++		host_fatal("cannot read the game image " HOST_PACKAGE_ROOT "/halo_guest.elf");
++	if (host_load_image(image, image_size) != 0)
++	{
++		host_memory_report_low_mappings();
++		host_fatal("cannot load the game image; see " HOST_DATA_ROOT "/opence.log");
++	}
++	free(image);
++	host_logf(HOST_LOG_INFO, "write tracking: page protection (16 KB pages)");
++	ps4_boot_trace("starting the game");
++	host_run_guest_main(make_boot(&environment));
++}
++
++int main(int argc, char *argv[])
++{
++	(void)argc;
++	(void)argv;
++	host_logf(HOST_LOG_INFO, "OpenCE for PS4 starting");
++	ps4_boot_trace("OpenCE " OPENCE_PS4_VERSION " starting");
++	if (host_memory_initialize() != 0)
++	{
++		host_memory_report_low_mappings();
++		host_fatal("cannot reserve the game's memory below 4 GB; see " HOST_DATA_ROOT "/opence.log");
++	}
++	host_install_signal_handlers();
++	if (host_native_thread_create(game_main, NULL, MAIN_STACK_SIZE, "game") != 0)
++		host_fatal("cannot start the game thread");
++	/* the game ends the process itself (host_exit) */
++	for (;;)
++		ps4_usleep(1000000);
++}
+diff --git a/port/ps4/host/host_memory.c b/port/ps4/host/host_memory.c
+new file mode 100644
+index 00000000..b6eb66cb
+--- /dev/null
++++ b/port/ps4/host/host_memory.c
+@@ -0,0 +1,799 @@
++/*
++HOST_MEMORY.C
++
++Guest address space for the PS4 port.
++
++Everything the guest touches lies below 4 GB. On the PS4 that range holds
++only the eboot (at 0x400000); the kernel library and the host's heap live
++far above it. At start-up the host takes:
++
++- the Xbox contiguous window at 0x80000000 (128 MB), mapped whole;
++- the guest image's range right above it, mapped when the image loads,
++  readable, writable and executable (system flexible memory, the only
++  memory the PS4 lets an app run code from: the SSBU port's finding);
++- the rest of the space below 4 GB as pools, reserved address space whose
++  64 KB chunks are mapped with direct memory as they are handed out (to the
++  guest's malloc arenas, thread stacks and anonymous mappings). The PS4 has
++  no demand-zero memory to speak of: its anonymous (flexible) memory is a few
++  hundred MB, committed when mapped; an app has ~4.5 GB of direct memory.
++
++This file also implements guest memory write tracking (the interface of
++port/linux/src/memory_watch.c): the renderer write-protects the pages behind
++the textures it caches, and the fault handler here records the first write
++to each. The PS4 protects memory in 16 KB pages, so a watched page is 16 KB
++here (4 KB on Linux and Android): a write anywhere in it counts for all of
++it. A system call cannot fault on the guest's behalf (it fails with EFAULT),
++so the host makes pages writable before it reads into them
++(host_memory_prepare_write).
++*/
++
++#include "host.h"
++#include "host_watch_hash.h"
++
++#include <errno.h>
++#include <pthread.h>
++#include <sched.h>
++#include <signal.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <ucontext.h>
++#include <unistd.h>
++
++/* libkernel, declared by hand (as the SSBU port's runtime/ps4/memory.c:
++several OpenOrbis prototypes are wrong or take no parameters) */
++int32_t ps4_reserve_range(void **address, size_t size, int32_t flags, size_t alignment) __asm__("sceKernelReserveVirtualRange");
++int32_t ps4_map_direct(void **address, size_t size, int32_t protection, int32_t flags, off_t physical, size_t alignment) __asm__("sceKernelMapDirectMemory");
++int32_t ps4_allocate_direct(off_t start, off_t end, size_t size, size_t alignment, int32_t type, off_t *physical) __asm__("sceKernelAllocateDirectMemory");
++size_t ps4_direct_memory_size(void) __asm__("sceKernelGetDirectMemorySize");
++int32_t ps4_available_direct(off_t start, off_t end, size_t alignment, off_t *physical, size_t *size) __asm__("sceKernelAvailableDirectMemorySize");
++int32_t ps4_munmap(void *address, size_t size) __asm__("sceKernelMunmap");
++int32_t ps4_mprotect(const void *address, size_t size, int32_t protection) __asm__("sceKernelMprotect");
++int32_t ps4_map_system_flexible(void **address, size_t size, int32_t protection, int32_t flags, const char *name) __asm__("sceKernelMapNamedSystemFlexibleMemory");
++int32_t ps4_map_flexible(void **address, size_t size, int32_t protection, int32_t flags, const char *name) __asm__("sceKernelMapNamedFlexibleMemory");
++
++#define PS4_MAP_FIXED 0x10
++#define PS4_WB_ONION 0
++#define PROT_RW (PROT_READ | PROT_WRITE)
++#define PROT_RWX (PROT_READ | PROT_WRITE | PROT_EXEC)
++
++/* the guest's Linux mmap flags (port/ps4/guest/libc/arch/x32_guest) */
++#define GUEST_MAP_FIXED 0x10
++#define GUEST_MAP_ANONYMOUS 0x20
++#define GUEST_MAP_FIXED_NOREPLACE 0x100000
++#define GUEST_EINVAL 22
++#define GUEST_ENOMEM 12
++#define GUEST_EFAULT 14
++
++#define LOW_LIMIT 0x100000000ULL
++#define HOST_PAGE 0x4000ULL           /* what is protected */
++#define CHUNK 0x10000ULL              /* what is mapped */
++#define CHUNK_COUNT (LOW_LIMIT / CHUNK)
++#define BLOCK (32ULL << 20)           /* what direct memory is allocated in */
++#define MAXIMUM_FREE_CHUNKS 65536
++
++/* the pools, in the order they are drawn from: above the image first (the
++Custom Edition tag cache wants 0x40440000, Xbox build pointers) */
++static const struct { uint64_t base, end; } pool_ranges[] =
++{
++	{ 0x8c000000ULL, 0xff000000ULL },
++	{ 0x42000000ULL, 0x80000000ULL },
++	{ 0x20000000ULL, 0x42000000ULL },
++};
++#define POOL_RANGE_COUNT (sizeof(pool_ranges) / sizeof(pool_ranges[0]))
++
++/* each 64 KB chunk below 4 GB: none of ours, reserved and free, or handed
++out (then backed by direct memory, its offset / CHUNK + 1 in chunk_physical) */
++enum { _chunk_none, _chunk_free, _chunk_used };
++static uint8_t chunk_state[CHUNK_COUNT];
++static uint32_t chunk_physical[CHUNK_COUNT];
++static int pool_reserved[POOL_RANGE_COUNT];
++static pthread_mutex_t memory_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static uint64_t window_base, window_end;
++static uint64_t image_base, image_end;
++
++/* direct memory, handed out by chunk from blocks */
++static uint64_t block_at, block_size, block_used;
++static uint32_t free_physical[MAXIMUM_FREE_CHUNKS];
++static uint32_t free_physical_count;
++static uint64_t mapped_bytes;
++
++static uint64_t round_up(uint64_t value, uint64_t to)
++{
++	return (value + to - 1) & ~(to - 1);
++}
++
++static int in_range(uint64_t address, uint64_t size, uint64_t base, uint64_t end)
++{
++	return address >= base && address + size <= end && address + size >= address;
++}
++
++uint64_t host_direct_memory_free(void)
++{
++	off_t start = 0;
++	size_t size = 0;
++
++	if (ps4_available_direct(0, (off_t)ps4_direct_memory_size(), CHUNK, &start, &size) != 0)
++		return 0;
++	return size;
++}
++
++/* ---------- direct memory */
++
++#define NO_PHYSICAL 0xffffffffu
++
++static uint32_t physical_take(void)
++{
++	if (free_physical_count)
++		return free_physical[--free_physical_count];
++	if (block_used == block_size)
++	{
++		off_t physical = 0;
++		uint64_t size = BLOCK;
++
++		while (ps4_allocate_direct(0, (off_t)ps4_direct_memory_size(), size, CHUNK, PS4_WB_ONION, &physical) != 0)
++		{
++			size /= 2;
++			if (size < CHUNK)
++				return NO_PHYSICAL;
++		}
++		block_at = (uint64_t)physical;
++		block_size = size;
++		block_used = 0;
++	}
++	block_used += CHUNK;
++	return (uint32_t)((block_at + block_used - CHUNK) / CHUNK);
++}
++
++static void physical_give(uint32_t physical)
++{
++	if (free_physical_count < MAXIMUM_FREE_CHUNKS)
++		free_physical[free_physical_count++] = physical;
++}
++
++static void reserve_back(uint64_t address, uint64_t size)
++{
++	void *at = (void *)(uintptr_t)address;
++
++	ps4_reserve_range(&at, size, PS4_MAP_FIXED, 0);
++}
++
++/* backs chunk index with zeroed direct memory (under memory_lock) */
++static int chunk_map(uint64_t index, int protection)
++{
++	uint64_t address = index * CHUNK;
++	uint32_t physical = physical_take();
++	void *at = (void *)(uintptr_t)address;
++
++	if (physical == NO_PHYSICAL)
++		return -1;
++	/* (mapping over our own reservation fails) */
++	ps4_munmap(at, CHUNK);
++	if (ps4_map_direct(&at, CHUNK, PROT_RW, PS4_MAP_FIXED, (off_t)physical * (off_t)CHUNK, CHUNK) != 0 ||
++		at != (void *)(uintptr_t)address)
++	{
++		reserve_back(address, CHUNK);
++		physical_give(physical);
++		return -1;
++	}
++	/* direct memory comes with whatever was there before */
++	memset(at, 0, CHUNK);
++	if (protection != PROT_RW)
++		ps4_mprotect(at, CHUNK, protection);
++	chunk_physical[index] = physical + 1;
++	chunk_state[index] = _chunk_used;
++	mapped_bytes += CHUNK;
++	return 0;
++}
++
++static void chunk_unmap(uint64_t index)
++{
++	uint64_t address = index * CHUNK;
++
++	if (chunk_physical[index])
++	{
++		ps4_munmap((void *)(uintptr_t)address, CHUNK);
++		reserve_back(address, CHUNK);
++		physical_give(chunk_physical[index] - 1);
++		chunk_physical[index] = 0;
++		mapped_bytes -= CHUNK;
++	}
++	chunk_state[index] = _chunk_free;
++}
++
++/* ---------- the fixed ranges and the pools */
++
++int host_memory_initialize(void)
++{
++	off_t physical = 0;
++	void *at;
++	unsigned index;
++	int result;
++
++	/* the Xbox window, whole */
++	at = (void *)(uintptr_t)HALO_GUEST_WINDOW_BASE;
++	result = ps4_allocate_direct(0, (off_t)ps4_direct_memory_size(), HALO_GUEST_WINDOW_SIZE, 2 << 20, PS4_WB_ONION,
++		&physical);
++	if (result != 0)
++	{
++		host_logf(HOST_LOG_ERROR, "no direct memory for the Xbox window (%#x)", (unsigned)result);
++		return -1;
++	}
++	result = ps4_map_direct(&at, HALO_GUEST_WINDOW_SIZE, PROT_RW, PS4_MAP_FIXED, physical, 2 << 20);
++	if (result != 0 || at != (void *)(uintptr_t)HALO_GUEST_WINDOW_BASE)
++	{
++		host_logf(HOST_LOG_ERROR, "cannot map the Xbox window at %08x (%#x, got %p)", HALO_GUEST_WINDOW_BASE,
++			(unsigned)result, at);
++		return -1;
++	}
++	memset(at, 0, HALO_GUEST_WINDOW_SIZE);
++	window_base = HALO_GUEST_WINDOW_BASE;
++	window_end = window_base + HALO_GUEST_WINDOW_SIZE;
++
++	/* the image's range, address space only until the image loads */
++	at = (void *)(uintptr_t)HALO_GUEST_IMAGE_BASE;
++	result = ps4_reserve_range(&at, HALO_GUEST_IMAGE_RESERVE, PS4_MAP_FIXED, 0);
++	if (result != 0 || at != (void *)(uintptr_t)HALO_GUEST_IMAGE_BASE)
++	{
++		host_logf(HOST_LOG_ERROR, "cannot reserve the guest image range at %08x (%#x)", HALO_GUEST_IMAGE_BASE,
++			(unsigned)result);
++		return -1;
++	}
++
++	/* the pools */
++	for (index = 0; index < POOL_RANGE_COUNT; index++)
++	{
++		uint64_t base = pool_ranges[index].base, end = pool_ranges[index].end, chunk;
++
++		at = (void *)(uintptr_t)base;
++		result = ps4_reserve_range(&at, end - base, PS4_MAP_FIXED, 0);
++		if (result != 0 || at != (void *)(uintptr_t)base)
++		{
++			host_logf(HOST_LOG_WARN, "guest pool %08llx-%08llx not reserved (%#x, got %p)",
++				(unsigned long long)base, (unsigned long long)end, (unsigned)result, at);
++			continue;
++		}
++		pool_reserved[index] = 1;
++		for (chunk = base / CHUNK; chunk < end / CHUNK; chunk++)
++			chunk_state[chunk] = _chunk_free;
++		host_logf(HOST_LOG_INFO, "guest pool %08llx-%08llx (%llu MB)", (unsigned long long)base,
++			(unsigned long long)end, (unsigned long long)((end - base) >> 20));
++	}
++	host_logf(HOST_LOG_INFO, "Xbox window %08x-%08x, image range %08x-%08x; direct memory free %llu MB",
++		HALO_GUEST_WINDOW_BASE, HALO_GUEST_WINDOW_BASE + HALO_GUEST_WINDOW_SIZE, HALO_GUEST_IMAGE_BASE,
++		HALO_GUEST_IMAGE_BASE + HALO_GUEST_IMAGE_RESERVE, (unsigned long long)(host_direct_memory_free() >> 20));
++	return 0;
++}
++
++/* the code (and the read-only data after it) in executable flexible memory,
++the writable data and bss in direct memory chunks */
++int host_memory_map_image(uint32_t base, uint32_t code_size, uint32_t size)
++{
++	uint64_t code_length = round_up(code_size, CHUNK), length = round_up(size, CHUNK), chunk;
++	void *at = (void *)(uintptr_t)base;
++	int result;
++
++	if (base != HALO_GUEST_IMAGE_BASE || length > HALO_GUEST_IMAGE_RESERVE || code_length > length)
++	{
++		host_logf(HOST_LOG_ERROR, "the guest image (%08x, %u bytes) does not fit its range", base, size);
++		return -1;
++	}
++	ps4_munmap(at, code_length);
++	result = ps4_map_system_flexible(&at, code_length, PROT_RWX, PS4_MAP_FIXED, "opence guest code");
++	if (result != 0 || at != (void *)(uintptr_t)base)
++	{
++		host_logf(HOST_LOG_WARN, "guest image: no executable system flexible memory (%#x), trying flexible memory",
++			(unsigned)result);
++		at = (void *)(uintptr_t)base;
++		result = ps4_map_flexible(&at, code_length, PROT_RWX, PS4_MAP_FIXED, "opence guest code");
++	}
++	if (result != 0 || at != (void *)(uintptr_t)base)
++	{
++		host_logf(HOST_LOG_ERROR, "cannot map the guest code at %08x (%#x, got %p)", base, (unsigned)result, at);
++		reserve_back(base, code_length);
++		return -1;
++	}
++	memset(at, 0, code_length);
++	pthread_mutex_lock(&memory_lock);
++	for (chunk = (base + code_length) / CHUNK; chunk < (base + length) / CHUNK; chunk++)
++	{
++		chunk_state[chunk] = _chunk_free;
++		if (chunk_map(chunk, PROT_RW) != 0)
++		{
++			pthread_mutex_unlock(&memory_lock);
++			host_logf(HOST_LOG_ERROR, "no direct memory for the guest image's data");
++			return -1;
++		}
++	}
++	pthread_mutex_unlock(&memory_lock);
++	image_base = base;
++	image_end = base + length;
++	host_logf(HOST_LOG_INFO, "guest image: %llu KB of code at %08x, %llu KB of data", (unsigned long long)(code_length >> 10),
++		base, (unsigned long long)((length - code_length) >> 10));
++	return 0;
++}
++
++void host_memory_report_low_mappings(void)
++{
++	unsigned index;
++
++	host_logf(HOST_LOG_INFO, "below 4 GB: window %08llx-%08llx, image %08llx-%08llx, %llu MB of pool chunks mapped",
++		(unsigned long long)window_base, (unsigned long long)window_end, (unsigned long long)image_base,
++		(unsigned long long)image_end, (unsigned long long)(mapped_bytes >> 20));
++	for (index = 0; index < POOL_RANGE_COUNT; index++)
++		host_logf(HOST_LOG_INFO, "  pool %08llx-%08llx %s", (unsigned long long)pool_ranges[index].base,
++			(unsigned long long)pool_ranges[index].end, pool_reserved[index] ? "reserved" : "unavailable");
++}
++
++/* ---------- pools */
++
++/* the first run of count free chunks, in pool order; 0 if none */
++static uint64_t chunks_find(uint64_t count)
++{
++	unsigned range;
++
++	for (range = 0; range < POOL_RANGE_COUNT; range++)
++	{
++		uint64_t first = pool_ranges[range].base / CHUNK, end = pool_ranges[range].end / CHUNK, chunk, run = 0;
++
++		if (!pool_reserved[range])
++			continue;
++		for (chunk = first; chunk < end; chunk++)
++		{
++			if (chunk_state[chunk] != _chunk_free)
++			{
++				run = 0;
++				continue;
++			}
++			if (++run == count)
++				return chunk + 1 - count;
++		}
++	}
++	return 0;
++}
++
++static int chunks_map(uint64_t first, uint64_t count, int protection)
++{
++	uint64_t chunk;
++
++	for (chunk = first; chunk < first + count; chunk++)
++	{
++		if (chunk_map(chunk, protection) != 0)
++		{
++			while (chunk > first)
++				chunk_unmap(--chunk);
++			return -1;
++		}
++	}
++	return 0;
++}
++
++void *host_low_map(size_t size, int protection)
++{
++	uint64_t count = round_up(size, CHUNK) / CHUNK, first;
++	void *result = NULL;
++
++	if (!count)
++		return NULL;
++	/* (PROT_NONE reservations are backed too: the PS4 cannot fault pages in
++	later, and the guest makes them accessible with mprotect) */
++	if (protection == PROT_NONE)
++		protection = PROT_RW;
++	pthread_mutex_lock(&memory_lock);
++	first = chunks_find(count);
++	if (first && chunks_map(first, count, protection) == 0)
++		result = (void *)(uintptr_t)(first * CHUNK);
++	pthread_mutex_unlock(&memory_lock);
++	if (!result)
++		host_logf(HOST_LOG_ERROR, "guest memory: %llu KB could not be mapped (%llu MB mapped, %llu MB direct free)",
++			(unsigned long long)(count * CHUNK >> 10), (unsigned long long)(mapped_bytes >> 20),
++			(unsigned long long)(host_direct_memory_free() >> 20));
++	return result;
++}
++
++void host_low_unmap(void *address, size_t size)
++{
++	uint64_t first = (uint64_t)(uintptr_t)address / CHUNK;
++	uint64_t end = round_up((uint64_t)(uintptr_t)address + size, CHUNK) / CHUNK, chunk;
++
++	if (end > CHUNK_COUNT)
++		return;
++	pthread_mutex_lock(&memory_lock);
++	for (chunk = first; chunk < end; chunk++)
++	{
++		if (chunk_state[chunk] == _chunk_used)
++			chunk_unmap(chunk);
++	}
++	pthread_mutex_unlock(&memory_lock);
++}
++
++int host_low_owns(uintptr_t address, size_t size)
++{
++	uint64_t chunk, end;
++
++	if (in_range(address, size, window_base, window_end) || in_range(address, size, image_base, image_end))
++		return 1;
++	if ((uint64_t)address + size > LOW_LIMIT || !size)
++		return 0;
++	end = round_up((uint64_t)address + size, CHUNK) / CHUNK;
++	for (chunk = address / CHUNK; chunk < end; chunk++)
++	{
++		if (chunk_state[chunk] != _chunk_used)
++			return 0;
++	}
++	return 1;
++}
++
++/* ---------- the guest's memory system calls */
++
++/* makes [address, address + length) of the pools fresh zeroed memory, mapped
++where it was not; -errno on failure */
++static long pool_replace(uint64_t address, uint64_t length, int protection, int replace)
++{
++	uint64_t first = address / CHUNK, end = round_up(address + length, CHUNK) / CHUNK, chunk;
++	long result = 0;
++
++	if (protection == PROT_NONE)
++		protection = PROT_RW;
++	pthread_mutex_lock(&memory_lock);
++	for (chunk = first; chunk < end; chunk++)
++	{
++		if (chunk_state[chunk] == _chunk_none || (chunk_state[chunk] == _chunk_used && !replace))
++		{
++			result = -GUEST_EINVAL;
++			break;
++		}
++	}
++	for (chunk = first; chunk < end && !result; chunk++)
++	{
++		if (chunk_state[chunk] == _chunk_free && chunk_map(chunk, protection) != 0)
++			result = -GUEST_ENOMEM;
++	}
++	pthread_mutex_unlock(&memory_lock);
++	if (!result)
++	{
++		ps4_mprotect((void *)(uintptr_t)(address & ~(HOST_PAGE - 1)), round_up(address + length, HOST_PAGE) -
++			(address & ~(HOST_PAGE - 1)), PROT_RW);
++		memset((void *)(uintptr_t)address, 0, length);
++		if (protection != PROT_RW)
++			ps4_mprotect((void *)(uintptr_t)address, length, protection);
++	}
++	return result;
++}
++
++static void window_written(uint64_t address, uint64_t size);
++
++long host_guest_mmap(uint64_t address, uint64_t size, int protection, int flags, int fd, int64_t offset)
++{
++	uint64_t length = round_up(size, HOST_PAGE);
++	long result;
++
++	if (!length)
++		return -GUEST_EINVAL;
++	protection &= PROT_RWX;
++	if (flags & (GUEST_MAP_FIXED | GUEST_MAP_FIXED_NOREPLACE))
++	{
++		if (address + length > LOW_LIMIT)
++			return -GUEST_ENOMEM;
++		if (in_range(address, length, window_base, window_end))
++		{
++			/* the window stays mapped and writable (16 KB host pages hold four
++			of the guest's): a fresh block is zeroed, a freed one left as it is */
++			window_written(address, size);
++			if (protection != PROT_NONE)
++				memset((void *)(uintptr_t)address, 0, size);
++			result = (long)address;
++		}
++		else if (in_range(address, length, image_base, image_end))
++		{
++			return -GUEST_EINVAL;
++		}
++		else
++		{
++			result = pool_replace(address, length, protection, !(flags & GUEST_MAP_FIXED_NOREPLACE));
++			if (result == 0)
++				result = (long)address;
++		}
++	}
++	else
++	{
++		void *mapped = host_low_map(length, protection);
++
++		if (!mapped)
++			return -GUEST_ENOMEM;
++		result = (long)(uintptr_t)mapped;
++	}
++	/* a file mapping: a private copy of the file's bytes */
++	if (result > 0 && !(flags & GUEST_MAP_ANONYMOUS) && fd >= 0)
++	{
++		uint64_t done = 0;
++
++		ps4_mprotect((void *)(uintptr_t)(result & ~(HOST_PAGE - 1)), round_up((uint64_t)result + length, HOST_PAGE) -
++			((uint64_t)result & ~(HOST_PAGE - 1)), PROT_RW);
++		while (done < size)
++		{
++			ssize_t got = pread(fd, (char *)(uintptr_t)result + done, size - done, offset + (off_t)done);
++
++			if (got <= 0)
++				break;
++			done += (uint64_t)got;
++		}
++		if (protection != PROT_RW && protection != PROT_NONE)
++			ps4_mprotect((void *)(uintptr_t)result, length, protection);
++	}
++	return result;
++}
++
++long host_guest_munmap(uint64_t address, uint64_t size)
++{
++	uint64_t length = round_up(size, HOST_PAGE);
++
++	if (address + length > LOW_LIMIT)
++		return -GUEST_EINVAL;
++	if (in_range(address, length, window_base, window_end))
++	{
++		window_written(address, size);
++		return 0;
++	}
++	if (in_range(address, length, image_base, image_end))
++		return -GUEST_EINVAL;
++	host_low_unmap((void *)(uintptr_t)address, length);
++	return 0;
++}
++
++long host_guest_mprotect(uint64_t address, uint64_t size, int protection)
++{
++	uint64_t start = address & ~(HOST_PAGE - 1), end = round_up(address + size, HOST_PAGE);
++
++	if (end > LOW_LIMIT)
++		return -GUEST_EINVAL;
++	/* the window's protection belongs to the write tracking: the guest's
++	4 KB pages share the PS4's 16 KB ones */
++	if (in_range(address, size, window_base, window_end))
++		return 0;
++	if (!host_low_owns(start, end - start))
++		return -GUEST_ENOMEM;
++	if (protection == PROT_NONE && (address & (HOST_PAGE - 1) || size & (HOST_PAGE - 1)))
++		return 0;
++	return ps4_mprotect((void *)(uintptr_t)start, end - start, protection & PROT_RWX) ? -GUEST_EINVAL : 0;
++}
++
++/* ---------- write tracking (port/linux/src/memory_watch.c) */
++
++#define WATCH_PAGE HOST_PAGE
++#define WATCH_PAGE_COUNT (HALO_GUEST_WINDOW_SIZE / WATCH_PAGE)
++
++/* (each page: 0 not watched, 1 watched and read-only, 2 made writable by a
++watched write; as Android's host_memory.c) */
++static uint8_t page_protected[WATCH_PAGE_COUNT];
++static uint32_t page_generation[WATCH_PAGE_COUNT];
++static volatile uint32_t current_generation = 1;
++static int watch_active;
++static int watch_hashing;
++static uint8_t page_hash_watched[HALO_GUEST_WINDOW_SIZE / WATCH_HASH_PAGE_SIZE];
++static uint64_t page_hash[HALO_GUEST_WINDOW_SIZE / WATCH_HASH_PAGE_SIZE];
++static uint32_t page_hashed_frame[HALO_GUEST_WINDOW_SIZE / WATCH_HASH_PAGE_SIZE];
++static uint32_t page_hash_generation[HALO_GUEST_WINDOW_SIZE / WATCH_HASH_PAGE_SIZE];
++static struct watch_hash page_hashes =
++{
++	.base = (const uint8_t *)(uintptr_t)HALO_GUEST_WINDOW_BASE,
++	.page_count = HALO_GUEST_WINDOW_SIZE / WATCH_HASH_PAGE_SIZE,
++	.watched = page_hash_watched,
++	.hash = page_hash,
++	.hashed_frame = page_hashed_frame,
++	.generation = page_hash_generation,
++	.current_generation = &current_generation,
++	.frame = 1,
++};
++
++static int in_window(uint64_t address)
++{
++	return address >= HALO_GUEST_WINDOW_BASE && address - HALO_GUEST_WINDOW_BASE < HALO_GUEST_WINDOW_SIZE;
++}
++
++static uint64_t watch_page(uint64_t address)
++{
++	return (address - HALO_GUEST_WINDOW_BASE) / WATCH_PAGE;
++}
++
++static void mark_written(uint64_t page)
++{
++	page_generation[page] = __sync_add_and_fetch(&current_generation, 1);
++	page_protected[page] = 2;
++	ps4_mprotect((void *)(uintptr_t)(HALO_GUEST_WINDOW_BASE + page * WATCH_PAGE), WATCH_PAGE, PROT_RW);
++}
++
++/* [first, last] of the watch pages of a range clipped to the window; 0 if
++none */
++static int watch_pages(uint64_t address, uint64_t size, uint64_t *first, uint64_t *last)
++{
++	uint64_t start = address, end = address + size;
++
++	if (!size || end <= HALO_GUEST_WINDOW_BASE || start >= (uint64_t)HALO_GUEST_WINDOW_BASE + HALO_GUEST_WINDOW_SIZE)
++		return 0;
++	if (start < HALO_GUEST_WINDOW_BASE)
++		start = HALO_GUEST_WINDOW_BASE;
++	if (end > (uint64_t)HALO_GUEST_WINDOW_BASE + HALO_GUEST_WINDOW_SIZE)
++		end = (uint64_t)HALO_GUEST_WINDOW_BASE + HALO_GUEST_WINDOW_SIZE;
++	*first = watch_page(start);
++	*last = watch_page(end - 1);
++	return 1;
++}
++
++/* a remapped or freed block of the window: treat its pages as written and
++unwatched */
++static void window_written(uint64_t address, uint64_t size)
++{
++	uint64_t first, last, page;
++
++	if (!watch_pages(address, size, &first, &last))
++		return;
++	if (watch_hashing)
++	{
++		watch_hash_forget(&page_hashes, (uint32_t)((address - HALO_GUEST_WINDOW_BASE) / WATCH_HASH_PAGE_SIZE),
++			(uint32_t)((address + size - 1 - HALO_GUEST_WINDOW_BASE) / WATCH_HASH_PAGE_SIZE));
++		return;
++	}
++	for (page = first; page <= last; page++)
++	{
++		if (page_protected[page] == 1)
++			ps4_mprotect((void *)(uintptr_t)(HALO_GUEST_WINDOW_BASE + page * WATCH_PAGE), WATCH_PAGE, PROT_RW);
++		page_protected[page] = 0;
++		page_generation[page] = __sync_add_and_fetch(&current_generation, 1);
++	}
++}
++
++void host_memory_prepare_write(uint64_t address, uint64_t size)
++{
++	uint64_t first, last, page;
++
++	if (!watch_active || watch_hashing || !watch_pages(address, size, &first, &last))
++		return;
++	for (page = first; page <= last; page++)
++	{
++		if (page_protected[page] == 1)
++			mark_written(page);
++	}
++}
++
++static struct sigaction previous_segv, previous_bus;
++
++static void chain(struct sigaction *previous, int signal_number, siginfo_t *information, void *context)
++{
++	sigaction(signal_number, previous, NULL);
++	if (previous->sa_flags & SA_SIGINFO)
++	{
++		if (previous->sa_sigaction)
++			previous->sa_sigaction(signal_number, information, context);
++	}
++	else if (previous->sa_handler != SIG_DFL && previous->sa_handler != SIG_IGN)
++	{
++		previous->sa_handler(signal_number);
++	}
++	/* returning re-executes the faulting instruction under the previous
++	(or default) handler */
++}
++
++void host_debug_report_fault(int signal_number, siginfo_t *information, void *context);
++
++/* a write to a watched page; nonzero if it was one */
++static int watch_fault(uint64_t address)
++{
++	if (watch_active && !watch_hashing && in_window(address))
++	{
++		uint64_t page = watch_page(address);
++
++		if (page_protected[page] == 1)
++		{
++			mark_written(page);
++			return 1;
++		}
++		/* made writable by another thread meanwhile: the write is made again */
++		if (page_protected[page] == 2)
++			return 1;
++	}
++	return 0;
++}
++
++static void segv_handler(int signal_number, siginfo_t *information, void *context)
++{
++	if (watch_fault((uint64_t)(uintptr_t)information->si_addr))
++		return;
++	host_debug_report_fault(signal_number, information, context);
++	chain(&previous_segv, signal_number, information, context);
++}
++
++static void bus_handler(int signal_number, siginfo_t *information, void *context)
++{
++	/* (the PS4 reports some protection faults as SIGBUS) */
++	if (watch_fault((uint64_t)(uintptr_t)information->si_addr))
++		return;
++	host_debug_report_fault(signal_number, information, context);
++	chain(&previous_bus, signal_number, information, context);
++}
++
++void host_install_signal_handlers(void)
++{
++	struct sigaction action;
++
++	memset(&action, 0, sizeof(action));
++	action.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
++	sigemptyset(&action.sa_mask);
++	action.sa_sigaction = segv_handler;
++	sigaction(SIGSEGV, &action, &previous_segv);
++	action.sa_sigaction = bus_handler;
++	sigaction(SIGBUS, &action, &previous_bus);
++}
++
++void host_memory_watch_initialize(void)
++{
++	watch_active = 1;
++}
++
++void host_memory_watch_use_hashes(void)
++{
++	watch_hashing = 1;
++}
++
++void host_memory_watch_protect(uint32_t address, uint32_t size)
++{
++	uint64_t first, last, page;
++
++	if (!watch_active || !watch_pages(address, size, &first, &last))
++		return;
++	if (watch_hashing)
++	{
++		watch_hash_protect(&page_hashes, (uint32_t)(((uint64_t)address - HALO_GUEST_WINDOW_BASE) / WATCH_HASH_PAGE_SIZE),
++			(uint32_t)(((uint64_t)address + size - 1 - HALO_GUEST_WINDOW_BASE) / WATCH_HASH_PAGE_SIZE));
++		return;
++	}
++	for (page = first; page <= last; page++)
++	{
++		if (page_protected[page] != 1)
++		{
++			page_protected[page] = 1;
++			ps4_mprotect((void *)(uintptr_t)(HALO_GUEST_WINDOW_BASE + page * WATCH_PAGE), WATCH_PAGE, PROT_READ);
++		}
++	}
++}
++
++uint32_t host_memory_watch_serial(void)
++{
++	return current_generation;
++}
++
++uint32_t host_memory_watch_generation(uint32_t address, uint32_t size)
++{
++	uint64_t first, last, page;
++	uint32_t newest = 0;
++
++	if (!watch_pages(address, size, &first, &last))
++		return 0;
++	if (watch_hashing)
++		return watch_hash_generation(&page_hashes,
++			(uint32_t)(((uint64_t)address - HALO_GUEST_WINDOW_BASE) / WATCH_HASH_PAGE_SIZE),
++			(uint32_t)(((uint64_t)address + size - 1 - HALO_GUEST_WINDOW_BASE) / WATCH_HASH_PAGE_SIZE));
++	for (page = first; page <= last; page++)
++	{
++		if (page_generation[page] > newest)
++			newest = page_generation[page];
++	}
++	return newest;
++}
++
++void host_memory_watch_prepare_write(uint32_t address, uint32_t size)
++{
++	host_memory_prepare_write(address, size);
++}
++
++void host_memory_watch_forget(uint32_t address, uint32_t size)
++{
++	window_written(address, size);
++}
++
++void host_memory_watch_begin_frame(void)
++{
++	if (watch_hashing)
++		watch_hash_begin_frame(&page_hashes);
++}
+diff --git a/port/ps4/host/host_posix_compat.h b/port/ps4/host/host_posix_compat.h
+new file mode 100644
+index 00000000..fb07351d
+--- /dev/null
++++ b/port/ps4/host/host_posix_compat.h
+@@ -0,0 +1,24 @@
++/*
++HOST_POSIX_COMPAT.H
++
++What the platform layer's posix_*.c files (compiled into the PS4 host, as
++into Android's) take from Linux and the PS4's C library lacks. Included
++before each of them by the eboot's build.
++*/
++
++#ifndef __HALO_PS4_HOST_POSIX_COMPAT_H
++#define __HALO_PS4_HOST_POSIX_COMPAT_H
++
++#include <sys/socket.h>
++
++/* (sockets are not inherited by anything on the PS4, and the only
++non-blocking one asked for at creation is Discord's, which a console has
++not) */
++#ifndef SOCK_CLOEXEC
++#define SOCK_CLOEXEC 0
++#endif
++#ifndef SOCK_NONBLOCK
++#define SOCK_NONBLOCK 0
++#endif
++
++#endif
+diff --git a/port/ps4/host/host_sdl.c b/port/ps4/host/host_sdl.c
+new file mode 100644
+index 00000000..38144076
+--- /dev/null
++++ b/port/ps4/host/host_sdl.c
+@@ -0,0 +1,709 @@
++/*
++HOST_SDL.C
++
++The SDL functions the guest imports (port/android/guest/runtime/guest_sdl.c),
++on the PS4's own services instead of SDL: VideoOut through Zink's
++swapchain (the window and its OpenGL ES context, frontends/ps4 in the PS4
++Mesa), the DualShock 4s through ScePad (one controller for each user signed
++in, up to four), and sound through sceAudioOut. Windows, contexts, gamepads
++and audio streams are small integer handles, as on Android; events are
++written in SDL3's layout, which both ABIs share for those without pointers.
++*/
++
++#include "host.h"
++
++#include <SDL3/SDL_audio.h>
++#include <SDL3/SDL_events.h>
++#include <SDL3/SDL_gamepad.h>
++#include <SDL3/SDL_messagebox.h>
++#include <SDL3/SDL_video.h>
++
++#include <orbis/AudioOut.h>
++#include <orbis/Pad.h>
++#include <orbis/UserService.h>
++
++#include <errno.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++
++#include "ps4_gl.h"
++
++static char last_error[256];
++static pthread_mutex_t sdl_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void set_error(const char *text)
++{
++	snprintf(last_error, sizeof(last_error), "%s", text);
++}
++
++int host_sdl_init(uint32_t flags)
++{
++	(void)flags;
++	return 1;
++}
++
++int host_sdl_set_hint(const char *name, const char *value)
++{
++	(void)name;
++	(void)value;
++	return 1;
++}
++
++void host_sdl_get_error(char *buffer, uint32_t size)
++{
++	if (size)
++		snprintf(buffer, size, "%s", last_error);
++}
++
++static uint64_t milliseconds_now(void)
++{
++	struct timespec now;
++
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
++}
++
++static uint64_t start_milliseconds;
++
++long long host_sdl_ticks(void)
++{
++	if (!start_milliseconds)
++		start_milliseconds = milliseconds_now();
++	return (long long)(milliseconds_now() - start_milliseconds);
++}
++
++long long host_sdl_thread_id(void)
++{
++	return host_thread_id();
++}
++
++/* ---------- events */
++
++#define EVENT_QUEUE 64
++
++static SDL_Event event_queue[EVENT_QUEUE];
++static int event_head, event_count;
++
++static void push_event(const SDL_Event *event)
++{
++	pthread_mutex_lock(&sdl_lock);
++	if (event_count < EVENT_QUEUE)
++	{
++		event_queue[(event_head + event_count) % EVENT_QUEUE] = *event;
++		event_count++;
++	}
++	pthread_mutex_unlock(&sdl_lock);
++}
++
++static void pads_update(int force);
++
++int host_sdl_poll_event(void *event)
++{
++	int found = 0;
++
++	pads_update(0);
++	pthread_mutex_lock(&sdl_lock);
++	if (event_count)
++	{
++		memcpy(event, &event_queue[event_head], sizeof(SDL_Event));
++		event_head = (event_head + 1) % EVENT_QUEUE;
++		event_count--;
++		found = 1;
++	}
++	pthread_mutex_unlock(&sdl_lock);
++	return found;
++}
++
++/* ---------- the window and its OpenGL ES context */
++
++static int gl_major = 3, gl_minor = 0, gl_depth = 24, gl_stencil = 8, gl_debug;
++static struct ps4gl_window *gl_window;
++static struct ps4gl_context *gl_context;
++
++uint32_t host_sdl_create_window(const char *title, int width, int height, long long flags)
++{
++	host_logf(HOST_LOG_INFO, "window \"%s\" asked for %dx%d (flags %llx): the screen is %dx%d", title ? title : "",
++		width, height, (unsigned long long)flags, HOST_SCREEN_WIDTH, HOST_SCREEN_HEIGHT);
++	return 1;
++}
++
++void host_sdl_window_size_in_pixels(uint32_t window, int *width, int *height)
++{
++	(void)window;
++	*width = HOST_SCREEN_WIDTH;
++	*height = HOST_SCREEN_HEIGHT;
++}
++
++int host_sdl_set_relative_mouse(uint32_t window, int enabled)
++{
++	(void)window;
++	(void)enabled;
++	return 1;
++}
++
++int host_sdl_gl_set_attribute(int attribute, int value)
++{
++	switch (attribute)
++	{
++	case SDL_GL_CONTEXT_MAJOR_VERSION: gl_major = value; break;
++	case SDL_GL_CONTEXT_MINOR_VERSION: gl_minor = value; break;
++	case SDL_GL_DEPTH_SIZE: gl_depth = value; break;
++	case SDL_GL_STENCIL_SIZE: gl_stencil = value; break;
++	case SDL_GL_CONTEXT_FLAGS: gl_debug = (value & SDL_GL_CONTEXT_DEBUG_FLAG) != 0; break;
++	default: break;
++	}
++	return 1;
++}
++
++uint32_t host_sdl_gl_create_context(uint32_t window)
++{
++	(void)window;
++	if (gl_context)
++		return 1;
++	ps4_boot_trace("gl: Zink");
++	if (!ps4gl_initialize())
++	{
++		host_logf(HOST_LOG_ERROR, "OpenGL: %s", ps4gl_error());
++		set_error(ps4gl_error());
++		return 0;
++	}
++	if (!gl_window)
++		gl_window = ps4gl_create_window(HOST_SCREEN_WIDTH, HOST_SCREEN_HEIGHT, gl_depth, gl_stencil);
++	if (gl_window)
++		gl_context = ps4gl_create_context(gl_window, 1, gl_major, gl_minor, gl_debug);
++	if (!gl_context)
++	{
++		host_logf(HOST_LOG_ERROR, "OpenGL ES %d.%d context: %s", gl_major, gl_minor, ps4gl_error());
++		set_error(ps4gl_error());
++		return 0;
++	}
++	host_logf(HOST_LOG_INFO, "OpenGL ES context (asked for %d.%d, depth %d, stencil %d) on Zink", gl_major, gl_minor,
++		gl_depth, gl_stencil);
++	ps4_boot_trace("gl: context");
++	return 1;
++}
++
++int host_sdl_gl_make_current(uint32_t window, uint32_t context)
++{
++	(void)window;
++	if (!context)
++		return ps4gl_make_current(NULL) ? 1 : 0;
++	return gl_context && ps4gl_make_current(gl_context) ? 1 : 0;
++}
++
++int host_sdl_gl_set_swap_interval(int interval)
++{
++	ps4gl_set_swap_interval(gl_context, interval);
++	return 1;
++}
++
++static uint64_t swaps;
++
++int host_sdl_gl_swap_window(uint32_t window)
++{
++	(void)window;
++	ps4gl_swap_buffers(gl_context);
++	if (++swaps == 1)
++		ps4_boot_trace("gl: first frame presented");
++	host_sdl_frame();
++	return 1;
++}
++
++/* ---------- the clipboard, messages */
++
++static char clipboard[1024];
++
++int host_sdl_set_clipboard_text(const char *text)
++{
++	snprintf(clipboard, sizeof(clipboard), "%s", text ? text : "");
++	return 1;
++}
++
++void host_sdl_get_clipboard_text(char *buffer, uint32_t size)
++{
++	if (size)
++		snprintf(buffer, size, "%s", clipboard);
++}
++
++void host_sdl_scancode_name(int scancode, char *buffer, uint32_t size)
++{
++	(void)scancode;
++	if (size)
++		buffer[0] = 0;
++}
++
++int host_sdl_scancode_from_name(const char *name)
++{
++	(void)name;
++	return 0;
++}
++
++int host_sdl_show_toast(const char *message, int duration, int gravity, int x, int y)
++{
++	(void)duration;
++	(void)gravity;
++	(void)x;
++	(void)y;
++	host_logf(HOST_LOG_INFO, "notice: %s", message ? message : "");
++	return 1;
++}
++
++int host_sdl_show_simple_message_box(uint32_t flags, const char *title, const char *message)
++{
++	host_logf((flags & SDL_MESSAGEBOX_ERROR) ? HOST_LOG_ERROR : HOST_LOG_INFO, "message (%s): %s",
++		title ? title : "", message ? message : "");
++	ps4_boot_trace(message ? message : "message");
++	return 1;
++}
++
++/* (no dialog yet: the default button, the first if none is) */
++int host_sdl_show_message_box(uint32_t flags, const char *title, const char *message, int default_index,
++	const char *button0, const char *button1, const char *button2)
++{
++	int chosen = default_index >= 0 ? default_index : 0;
++	const char *buttons[3] = { button0, button1, button2 };
++
++	host_logf(HOST_LOG_INFO, "question (%s): %s -> %s", title ? title : "", message ? message : "",
++		buttons[chosen] ? buttons[chosen] : "?");
++	(void)flags;
++	return chosen;
++}
++
++/* ---------- gamepads: one DualShock 4 for each user signed in */
++
++#define PAD_COUNT 4
++
++struct pad
++{
++	int user;
++	int handle;
++	OrbisPadData state;
++	uint64_t read_at;
++	uint64_t rumble_until;
++};
++
++static struct pad pads[PAD_COUNT];
++static int pads_ready;
++static uint64_t pads_checked_at;
++
++static void pads_initialize(void)
++{
++	int index;
++
++	if (pads_ready)
++		return;
++	sceUserServiceInitialize(NULL);
++	scePadInit();
++	for (index = 0; index < PAD_COUNT; index++)
++	{
++		pads[index].user = -1;
++		pads[index].handle = -1;
++	}
++	pads_ready = 1;
++}
++
++static void pad_event(Uint32 type, int index)
++{
++	SDL_Event event;
++
++	memset(&event, 0, sizeof(event));
++	event.gdevice.type = type;
++	event.gdevice.timestamp = (Uint64)host_sdl_ticks() * 1000000ULL;
++	event.gdevice.which = (SDL_JoystickID)(index + 1);
++	push_event(&event);
++}
++
++/* opens the pads of users who signed in, closes those of users who left
++(once a second, or when forced) */
++static void pads_update(int force)
++{
++	OrbisUserServiceLoginUserIdList users;
++	uint64_t now = milliseconds_now();
++	int index, slot;
++
++	pthread_mutex_lock(&sdl_lock);
++	pads_initialize();
++	if (!force && now - pads_checked_at < 1000)
++	{
++		pthread_mutex_unlock(&sdl_lock);
++		return;
++	}
++	pads_checked_at = now;
++	pthread_mutex_unlock(&sdl_lock);
++	memset(&users, 0xff, sizeof(users));
++	if (sceUserServiceGetLoginUserIdList(&users) != 0)
++		return;
++	/* users gone */
++	for (slot = 0; slot < PAD_COUNT; slot++)
++	{
++		int present = 0;
++
++		if (pads[slot].user < 0)
++			continue;
++		for (index = 0; index < ORBIS_USER_SERVICE_MAX_LOGIN_USERS; index++)
++			present |= users.userId[index] == pads[slot].user;
++		if (!present)
++		{
++			host_logf(HOST_LOG_INFO, "gamepad %d: user %d signed out", slot + 1, pads[slot].user);
++			scePadClose(pads[slot].handle);
++			pads[slot].user = -1;
++			pads[slot].handle = -1;
++			pad_event(SDL_EVENT_GAMEPAD_REMOVED, slot);
++		}
++	}
++	/* users new */
++	for (index = 0; index < ORBIS_USER_SERVICE_MAX_LOGIN_USERS; index++)
++	{
++		int user = users.userId[index], known = 0, handle;
++
++		if (user < 0)
++			continue;
++		for (slot = 0; slot < PAD_COUNT; slot++)
++			known |= pads[slot].user == user;
++		if (known)
++			continue;
++		for (slot = 0; slot < PAD_COUNT && pads[slot].user >= 0; slot++)
++			;
++		if (slot == PAD_COUNT)
++			break;
++		handle = scePadOpen(user, ORBIS_PAD_PORT_TYPE_STANDARD, 0, NULL);
++		if (handle < 0)
++			handle = scePadGetHandle(user, ORBIS_PAD_PORT_TYPE_STANDARD, 0);
++		if (handle < 0)
++		{
++			host_logf(HOST_LOG_WARN, "gamepad for user %d: scePadOpen %#x", user, (unsigned)handle);
++			continue;
++		}
++		memset(&pads[slot], 0, sizeof(pads[slot]));
++		pads[slot].user = user;
++		pads[slot].handle = handle;
++		host_logf(HOST_LOG_INFO, "gamepad %d: user %d's DualShock 4", slot + 1, user);
++		pad_event(SDL_EVENT_GAMEPAD_ADDED, slot);
++	}
++}
++
++static struct pad *pad_of(uint32_t gamepad)
++{
++	if (gamepad < 1 || gamepad > PAD_COUNT || pads[gamepad - 1].handle < 0)
++		return NULL;
++	return &pads[gamepad - 1];
++}
++
++static const OrbisPadData *pad_state(struct pad *pad)
++{
++	uint64_t now = milliseconds_now();
++
++	if (now - pad->read_at >= 4)
++	{
++		if (scePadReadState(pad->handle, &pad->state) != 0)
++			memset(&pad->state, 0, sizeof(pad->state));
++		pad->read_at = now;
++	}
++	return &pad->state;
++}
++
++void host_sdl_frame(void)
++{
++	uint64_t now = milliseconds_now();
++	int slot;
++
++	for (slot = 0; slot < PAD_COUNT; slot++)
++	{
++		if (pads[slot].handle >= 0 && pads[slot].rumble_until && now >= pads[slot].rumble_until)
++		{
++			OrbisPadVibeParam off = { 0, 0 };
++
++			scePadSetVibration(pads[slot].handle, &off);
++			pads[slot].rumble_until = 0;
++		}
++	}
++}
++
++int host_sdl_get_gamepads(uint32_t *ids, int capacity)
++{
++	int found = 0, slot;
++
++	pads_update(0);
++	for (slot = 0; slot < PAD_COUNT && found < capacity; slot++)
++	{
++		if (pads[slot].handle >= 0)
++			ids[found++] = (uint32_t)(slot + 1);
++	}
++	return found;
++}
++
++uint32_t host_sdl_open_gamepad(uint32_t id)
++{
++	return pad_of(id) ? id : 0;
++}
++
++uint32_t host_sdl_gamepad_from_id(uint32_t id)
++{
++	return pad_of(id) ? id : 0;
++}
++
++/* 0..255 sticks (128 at rest) as SDL's -32768..32767, triggers as 0..32767 */
++static int stick_axis(uint8_t value)
++{
++	return (int)value * 65535 / 255 - 32768;
++}
++
++int host_sdl_gamepad_axis(uint32_t gamepad, int axis)
++{
++	struct pad *pad = pad_of(gamepad);
++	const OrbisPadData *state;
++
++	if (!pad)
++		return 0;
++	state = pad_state(pad);
++	switch (axis)
++	{
++	case SDL_GAMEPAD_AXIS_LEFTX: return stick_axis(state->leftStick.x);
++	case SDL_GAMEPAD_AXIS_LEFTY: return stick_axis(state->leftStick.y);
++	case SDL_GAMEPAD_AXIS_RIGHTX: return stick_axis(state->rightStick.x);
++	case SDL_GAMEPAD_AXIS_RIGHTY: return stick_axis(state->rightStick.y);
++	case SDL_GAMEPAD_AXIS_LEFT_TRIGGER: return (int)state->analogButtons.l2 * 32767 / 255;
++	case SDL_GAMEPAD_AXIS_RIGHT_TRIGGER: return (int)state->analogButtons.r2 * 32767 / 255;
++	default: return 0;
++	}
++}
++
++int host_sdl_gamepad_button(uint32_t gamepad, int button)
++{
++	struct pad *pad = pad_of(gamepad);
++	uint32_t buttons;
++
++	if (!pad)
++		return 0;
++	buttons = pad_state(pad)->buttons;
++	switch (button)
++	{
++	case SDL_GAMEPAD_BUTTON_SOUTH: return (buttons & ORBIS_PAD_BUTTON_CROSS) != 0;
++	case SDL_GAMEPAD_BUTTON_EAST: return (buttons & ORBIS_PAD_BUTTON_CIRCLE) != 0;
++	case SDL_GAMEPAD_BUTTON_WEST: return (buttons & ORBIS_PAD_BUTTON_SQUARE) != 0;
++	case SDL_GAMEPAD_BUTTON_NORTH: return (buttons & ORBIS_PAD_BUTTON_TRIANGLE) != 0;
++	/* the touchpad's click is the Xbox controller's back */
++	case SDL_GAMEPAD_BUTTON_BACK: return (buttons & ORBIS_PAD_BUTTON_TOUCH_PAD) != 0;
++	case SDL_GAMEPAD_BUTTON_START: return (buttons & ORBIS_PAD_BUTTON_OPTIONS) != 0;
++	case SDL_GAMEPAD_BUTTON_LEFT_STICK: return (buttons & ORBIS_PAD_BUTTON_L3) != 0;
++	case SDL_GAMEPAD_BUTTON_RIGHT_STICK: return (buttons & ORBIS_PAD_BUTTON_R3) != 0;
++	case SDL_GAMEPAD_BUTTON_LEFT_SHOULDER: return (buttons & ORBIS_PAD_BUTTON_L1) != 0;
++	case SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER: return (buttons & ORBIS_PAD_BUTTON_R1) != 0;
++	case SDL_GAMEPAD_BUTTON_DPAD_UP: return (buttons & ORBIS_PAD_BUTTON_UP) != 0;
++	case SDL_GAMEPAD_BUTTON_DPAD_DOWN: return (buttons & ORBIS_PAD_BUTTON_DOWN) != 0;
++	case SDL_GAMEPAD_BUTTON_DPAD_LEFT: return (buttons & ORBIS_PAD_BUTTON_LEFT) != 0;
++	case SDL_GAMEPAD_BUTTON_DPAD_RIGHT: return (buttons & ORBIS_PAD_BUTTON_RIGHT) != 0;
++	case SDL_GAMEPAD_BUTTON_TOUCHPAD: return (buttons & ORBIS_PAD_BUTTON_TOUCH_PAD) != 0;
++	default: return 0;
++	}
++}
++
++int host_sdl_gamepad_type(uint32_t gamepad)
++{
++	return pad_of(gamepad) ? SDL_GAMEPAD_TYPE_PS4 : SDL_GAMEPAD_TYPE_UNKNOWN;
++}
++
++int host_sdl_rumble_gamepad(uint32_t gamepad, uint32_t low, uint32_t high, uint32_t milliseconds)
++{
++	struct pad *pad = pad_of(gamepad);
++	OrbisPadVibeParam vibration;
++
++	if (!pad)
++		return 0;
++	vibration.lgMotor = (uint8_t)(low >> 8);
++	vibration.smMotor = (uint8_t)(high >> 8);
++	scePadSetVibration(pad->handle, &vibration);
++	pad->rumble_until = (low || high) && milliseconds ? milliseconds_now() + milliseconds : 0;
++	return 1;
++}
++
++void host_sdl_close_gamepad(uint32_t gamepad)
++{
++	(void)gamepad;
++}
++
++/* ---------- audio: a stream feeds sceAudioOut from its own thread */
++
++#define AUDIO_GRAIN 256 /* frames a sceAudioOutOutput takes */
++#define AUDIO_BUFFER (64 * 1024)
++
++struct audio_stream
++{
++	int used;
++	uint32_t callback, userdata;
++	int channels;
++	int is_float;
++	int bytes_per_frame;
++	int running;
++	int closing;
++	int port;
++	uint8_t buffer[AUDIO_BUFFER];
++	uint32_t buffered;
++	pthread_mutex_t lock;
++};
++
++#define AUDIO_STREAMS 4
++
++static struct audio_stream audio_streams[AUDIO_STREAMS];
++
++static struct audio_stream *audio_of(uint32_t stream)
++{
++	if (stream < 1 || stream > AUDIO_STREAMS || !audio_streams[stream - 1].used)
++		return NULL;
++	return &audio_streams[stream - 1];
++}
++
++static void *audio_main(void *context)
++{
++	struct audio_stream *stream = context;
++	uint32_t handle = (uint32_t)(stream - audio_streams) + 1;
++	uint32_t grain = (uint32_t)(AUDIO_GRAIN * stream->bytes_per_frame);
++	uint8_t silence[AUDIO_GRAIN * 8 * 2];
++	uint8_t samples[AUDIO_GRAIN * 8 * 2];
++
++	memset(silence, 0, sizeof(silence));
++	while (!stream->closing)
++	{
++		const void *output = silence;
++
++		if (stream->running)
++		{
++			uint32_t buffered;
++
++			pthread_mutex_lock(&stream->lock);
++			buffered = stream->buffered;
++			pthread_mutex_unlock(&stream->lock);
++			/* the game's callback adds what is missing (SDL's
++			additional/total), with SDL_PutAudioStreamData */
++			if (buffered < grain && stream->callback)
++				host_call_guest(stream->callback, stream->userdata, handle, grain - buffered, grain);
++			pthread_mutex_lock(&stream->lock);
++			if (stream->buffered >= grain)
++			{
++				memcpy(samples, stream->buffer, grain);
++				memmove(stream->buffer, stream->buffer + grain, stream->buffered - grain);
++				stream->buffered -= grain;
++				output = samples;
++			}
++			pthread_mutex_unlock(&stream->lock);
++		}
++		/* (waits for the previous grain: the pace of the loop) */
++		sceAudioOutOutput(stream->port, output);
++	}
++	return NULL;
++}
++
++uint32_t host_sdl_open_audio_stream(uint32_t device, const void *spec, uint32_t callback, uint32_t userdata)
++{
++	const struct { int32_t format; int32_t channels; int32_t frequency; } *guest_spec = spec;
++	struct audio_stream *stream = NULL;
++	int index, format;
++	static int audio_initialized;
++
++	if (device == SDL_AUDIO_DEVICE_DEFAULT_RECORDING || !guest_spec)
++	{
++		set_error("no recording device on the PS4 yet");
++		return 0;
++	}
++	if ((guest_spec->format != SDL_AUDIO_S16LE && guest_spec->format != SDL_AUDIO_F32LE) ||
++		(guest_spec->channels != 1 && guest_spec->channels != 2) || guest_spec->frequency != 48000)
++	{
++		host_logf(HOST_LOG_ERROR, "audio: format %#x, %d channels at %d Hz is not supported",
++			(unsigned)guest_spec->format, guest_spec->channels, guest_spec->frequency);
++		set_error("unsupported audio format");
++		return 0;
++	}
++	for (index = 0; index < AUDIO_STREAMS && !stream; index++)
++	{
++		if (!audio_streams[index].used)
++			stream = &audio_streams[index];
++	}
++	if (!stream)
++		return 0;
++	if (!audio_initialized)
++	{
++		sceAudioOutInit();
++		audio_initialized = 1;
++	}
++	memset(stream, 0, sizeof(*stream));
++	pthread_mutex_init(&stream->lock, NULL);
++	stream->channels = guest_spec->channels;
++	stream->is_float = guest_spec->format == SDL_AUDIO_F32LE;
++	stream->bytes_per_frame = stream->channels * (stream->is_float ? 4 : 2);
++	stream->callback = callback;
++	stream->userdata = userdata;
++	format = stream->is_float ?
++		(stream->channels == 2 ? ORBIS_AUDIO_OUT_PARAM_FORMAT_FLOAT_STEREO : ORBIS_AUDIO_OUT_PARAM_FORMAT_FLOAT_MONO) :
++		(stream->channels == 2 ? ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO : ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_MONO);
++	/* (the system user: the main output) */
++	stream->port = sceAudioOutOpen(0xff, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, AUDIO_GRAIN, 48000, format);
++	if (stream->port < 0)
++	{
++		host_logf(HOST_LOG_ERROR, "audio: sceAudioOutOpen %#x", (unsigned)stream->port);
++		set_error("sceAudioOutOpen failed");
++		return 0;
++	}
++	stream->used = 1;
++	if (host_native_thread_create(audio_main, stream, 256 * 1024, "audio") != 0)
++	{
++		sceAudioOutClose(stream->port);
++		stream->used = 0;
++		return 0;
++	}
++	host_logf(HOST_LOG_INFO, "audio: %d channels of %s at 48 kHz", stream->channels, stream->is_float ? "float" : "16-bit");
++	return (uint32_t)(stream - audio_streams) + 1;
++}
++
++int host_sdl_put_audio_stream_data(uint32_t handle, const void *data, int length)
++{
++	struct audio_stream *stream = audio_of(handle);
++	uint32_t room;
++
++	if (!stream || length < 0)
++		return 0;
++	pthread_mutex_lock(&stream->lock);
++	room = AUDIO_BUFFER - stream->buffered;
++	if ((uint32_t)length > room)
++		length = (int)room;
++	memcpy(stream->buffer + stream->buffered, data, (size_t)length);
++	stream->buffered += (uint32_t)length;
++	pthread_mutex_unlock(&stream->lock);
++	return 1;
++}
++
++int host_sdl_resume_audio_stream_device(uint32_t handle)
++{
++	struct audio_stream *stream = audio_of(handle);
++
++	if (!stream)
++		return 0;
++	stream->running = 1;
++	return 1;
++}
++
++int host_sdl_get_audio_stream_data(uint32_t handle, void *data, int length)
++{
++	(void)handle;
++	(void)data;
++	(void)length;
++	return 0;
++}
++
++int host_sdl_get_audio_stream_available(uint32_t handle)
++{
++	struct audio_stream *stream = audio_of(handle);
++
++	return stream ? (int)stream->buffered : 0;
++}
++
++void host_sdl_destroy_audio_stream(uint32_t handle)
++{
++	struct audio_stream *stream = audio_of(handle);
++
++	if (!stream)
++		return;
++	stream->running = 0;
++	stream->closing = 1;
++}
+diff --git a/port/ps4/host/host_syscall.c b/port/ps4/host/host_syscall.c
+new file mode 100644
+index 00000000..c70fb443
+--- /dev/null
++++ b/port/ps4/host/host_syscall.c
+@@ -0,0 +1,986 @@
++/*
++HOST_SYSCALL.C
++
++System calls on behalf of the guest's musl runtime (its syscall_arch.h
++sends every call here), on the PS4.
++
++The guest's musl makes Linux system calls, numbered as AArch64's (the
++generic table, port/ps4/guest/libc/arch/x32_guest/bits/syscall.h.in), with
++Linux's flags, structures and error numbers. The PS4 has a FreeBSD kernel,
++which the host's C library speaks to: every call is translated here, through
++the host's own C library rather than the kernel. In particular:
++
++- open flags, error numbers and clocks are Linux's in the guest;
++- struct stat, struct dirent64 and timespec have the guest's layouts (its
++  time_t is 32-bit, as in the MSVC runtime);
++- the PS4 resolves no relative path (the SSBU port's finding): the guest's
++  working directory is kept here, and its relative paths made absolute;
++- futexes, which the PS4 lacks, are condition variables in buckets: a wake
++  wakes every waiter of the bucket, and musl's waits check again;
++- memory mappings stay below 4 GB (host_memory.c);
++- the standard output and error streams go to the host's log;
++- a read into a write-watched page would fail with EFAULT on the PS4 (it
++  does not fault): the pages are opened first (host_memory_prepare_write).
++*/
++
++#include "host.h"
++#include "guest_syscall_numbers.h"
++
++#include <dirent.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <pthread.h>
++#include <sched.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <sys/uio.h>
++#include <time.h>
++#include <unistd.h>
++
++int getentropy(void *buffer, size_t length);
++
++#define GUEST(type, value) ((type)(uintptr_t)(uint32_t)(value))
++
++/* ---------- Linux's numbers, as the guest has them */
++
++enum
++{
++	G_EPERM = 1, G_ENOENT = 2, G_ESRCH = 3, G_EINTR = 4, G_EIO = 5, G_ENXIO = 6, G_E2BIG = 7, G_EBADF = 9,
++	G_ECHILD = 10, G_EAGAIN = 11, G_ENOMEM = 12, G_EACCES = 13, G_EFAULT = 14, G_EBUSY = 16, G_EEXIST = 17,
++	G_EXDEV = 18, G_ENODEV = 19, G_ENOTDIR = 20, G_EISDIR = 21, G_EINVAL = 22, G_ENFILE = 23, G_EMFILE = 24,
++	G_ENOTTY = 25, G_EFBIG = 27, G_ENOSPC = 28, G_ESPIPE = 29, G_EROFS = 30, G_EMLINK = 31, G_EPIPE = 32,
++	G_ERANGE = 34, G_EDEADLK = 35, G_ENAMETOOLONG = 36, G_ENOLCK = 37, G_ENOSYS = 38, G_ENOTEMPTY = 39,
++	G_ELOOP = 40, G_EOVERFLOW = 75, G_ENOTSUP = 95, G_ETIMEDOUT = 110,
++};
++
++#define G_O_ACCMODE 03
++#define G_O_CREAT 0100
++#define G_O_EXCL 0200
++#define G_O_TRUNC 01000
++#define G_O_APPEND 02000
++#define G_O_NONBLOCK 04000
++#define G_O_DIRECTORY 040000
++#define G_O_CLOEXEC 02000000
++
++#define G_AT_FDCWD (-100)
++#define G_AT_REMOVEDIR 0x200
++#define G_AT_EMPTY_PATH 0x1000
++
++#define G_F_DUPFD 0
++#define G_F_GETFD 1
++#define G_F_SETFD 2
++#define G_F_GETFL 3
++#define G_F_SETFL 4
++#define G_F_GETLK 5
++#define G_F_SETLK 6
++#define G_F_SETLKW 7
++#define G_F_DUPFD_CLOEXEC 1030
++
++#define G_FUTEX_WAIT 0
++#define G_FUTEX_WAKE 1
++#define G_FUTEX_REQUEUE 3
++#define G_FUTEX_CMP_REQUEUE 4
++#define G_FUTEX_WAIT_BITSET 9
++#define G_FUTEX_WAKE_BITSET 10
++#define G_FUTEX_PRIVATE_FLAG 128
++#define G_FUTEX_CLOCK_REALTIME 256
++
++#define G_SIGABRT 6
++
++static long guest_error(int host_error)
++{
++	switch (host_error)
++	{
++	case EPERM: return -G_EPERM;
++	case ENOENT: return -G_ENOENT;
++	case ESRCH: return -G_ESRCH;
++	case EINTR: return -G_EINTR;
++	case EIO: return -G_EIO;
++	case ENXIO: return -G_ENXIO;
++	case E2BIG: return -G_E2BIG;
++	case EBADF: return -G_EBADF;
++	case ECHILD: return -G_ECHILD;
++	case EAGAIN: return -G_EAGAIN;
++	case ENOMEM: return -G_ENOMEM;
++	case EACCES: return -G_EACCES;
++	case EFAULT: return -G_EFAULT;
++	case EBUSY: return -G_EBUSY;
++	case EEXIST: return -G_EEXIST;
++	case EXDEV: return -G_EXDEV;
++	case ENODEV: return -G_ENODEV;
++	case ENOTDIR: return -G_ENOTDIR;
++	case EISDIR: return -G_EISDIR;
++	case EINVAL: return -G_EINVAL;
++	case ENFILE: return -G_ENFILE;
++	case EMFILE: return -G_EMFILE;
++	case ENOTTY: return -G_ENOTTY;
++	case EFBIG: return -G_EFBIG;
++	case ENOSPC: return -G_ENOSPC;
++	case ESPIPE: return -G_ESPIPE;
++	case EROFS: return -G_EROFS;
++	case EMLINK: return -G_EMLINK;
++	case EPIPE: return -G_EPIPE;
++	case ERANGE: return -G_ERANGE;
++	case EDEADLK: return -G_EDEADLK;
++	case ENAMETOOLONG: return -G_ENAMETOOLONG;
++	case ENOLCK: return -G_ENOLCK;
++	case ENOSYS: return -G_ENOSYS;
++	case ENOTEMPTY: return -G_ENOTEMPTY;
++	case ELOOP: return -G_ELOOP;
++	case EOVERFLOW: return -G_EOVERFLOW;
++	case ENOTSUP: return -G_ENOTSUP;
++	case ETIMEDOUT: return -G_ETIMEDOUT;
++	default: return -G_EIO;
++	}
++}
++
++static long result_of(long value)
++{
++	return value == -1 ? guest_error(errno) : value;
++}
++
++/* ---------- the guest's structures */
++
++struct guest_timespec
++{
++	int32_t seconds;
++	int32_t nanoseconds;
++};
++
++struct guest_iovec
++{
++	uint32_t base;
++	uint32_t length;
++};
++
++/* port/ps4/guest/libc/arch/x32_guest/kstat.h */
++struct guest_kstat
++{
++	uint64_t st_dev;
++	uint64_t st_ino;
++	uint32_t st_mode;
++	uint32_t st_nlink;
++	uint32_t st_uid;
++	uint32_t st_gid;
++	uint64_t st_rdev;
++	uint64_t pad;
++	int64_t st_size;
++	int32_t st_blksize;
++	int32_t pad2;
++	int64_t st_blocks;
++	int64_t st_atime_sec;
++	int64_t st_atime_nsec;
++	int64_t st_mtime_sec;
++	int64_t st_mtime_nsec;
++	int64_t st_ctime_sec;
++	int64_t st_ctime_nsec;
++	uint32_t unused[2];
++};
++
++struct guest_dirent64
++{
++	uint64_t d_ino;
++	int64_t d_off;
++	uint16_t d_reclen;
++	uint8_t d_type;
++	char d_name[];
++};
++
++/* musl's struct utsname */
++struct guest_utsname
++{
++	char sysname[65], nodename[65], release[65], version[65], machine[65], domainname[65];
++};
++
++/* musl's struct sysinfo, with the guest's 32-bit longs */
++struct guest_sysinfo
++{
++	int32_t uptime;
++	uint32_t loads[3];
++	uint32_t totalram, freeram, sharedram, bufferram, totalswap, freeswap;
++	uint16_t procs, pad;
++	uint32_t totalhigh, freehigh;
++	uint32_t mem_unit;
++	char reserved[256];
++};
++
++static int timespec_in(uint64_t address, struct timespec *result)
++{
++	const struct guest_timespec *value = GUEST(const struct guest_timespec *, address);
++
++	if (!address)
++		return 0;
++	result->tv_sec = value->seconds;
++	result->tv_nsec = value->nanoseconds;
++	return 1;
++}
++
++static void timespec_out(uint64_t address, const struct timespec *value)
++{
++	struct guest_timespec *result = GUEST(struct guest_timespec *, address);
++
++	if (!address)
++		return;
++	result->seconds = (int32_t)value->tv_sec;
++	result->nanoseconds = (int32_t)value->tv_nsec;
++}
++
++static void stat_out(const struct stat *information, uint64_t address)
++{
++	struct guest_kstat *result = GUEST(struct guest_kstat *, address);
++
++	memset(result, 0, sizeof(*result));
++	result->st_dev = (uint64_t)information->st_dev;
++	result->st_ino = (uint64_t)information->st_ino;
++	result->st_mode = (uint32_t)information->st_mode;
++	result->st_nlink = (uint32_t)information->st_nlink;
++	result->st_size = (int64_t)information->st_size;
++	result->st_blksize = (int32_t)information->st_blksize;
++	result->st_blocks = (int64_t)information->st_blocks;
++	result->st_atime_sec = (int64_t)information->st_atim.tv_sec;
++	result->st_atime_nsec = (int64_t)information->st_atim.tv_nsec;
++	result->st_mtime_sec = (int64_t)information->st_mtim.tv_sec;
++	result->st_mtime_nsec = (int64_t)information->st_mtim.tv_nsec;
++	result->st_ctime_sec = (int64_t)information->st_ctim.tv_sec;
++	result->st_ctime_nsec = (int64_t)information->st_ctim.tv_nsec;
++}
++
++/* ---------- paths: the guest's working directory */
++
++static char working_directory[1024] = HOST_DATA_ROOT;
++static pthread_mutex_t working_directory_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* the host path of a guest path (relative to the working directory, or to
++the directory dirfd when it is not AT_FDCWD: not supported); 0, or -errno */
++static long host_path(int dirfd, uint64_t address, char *result, size_t size)
++{
++	const char *path = GUEST(const char *, address);
++	int written;
++
++	if (!address)
++		return -G_EFAULT;
++	if (path[0] == '/')
++	{
++		written = snprintf(result, size, "%s", path);
++	}
++	else
++	{
++		if (dirfd != G_AT_FDCWD)
++			return -G_ENOSYS;
++		pthread_mutex_lock(&working_directory_lock);
++		if (!strcmp(path, ".") || !path[0])
++			written = snprintf(result, size, "%s", working_directory);
++		else
++			written = snprintf(result, size, "%s/%s", working_directory, path[0] == '.' && path[1] == '/' ? path + 2 : path);
++		pthread_mutex_unlock(&working_directory_lock);
++	}
++	return written < 0 || (size_t)written >= size ? -G_ENAMETOOLONG : 0;
++}
++
++static int host_open_flags(int flags)
++{
++	int result = flags & G_O_ACCMODE;
++
++	if (flags & G_O_CREAT) result |= O_CREAT;
++	if (flags & G_O_EXCL) result |= O_EXCL;
++	if (flags & G_O_TRUNC) result |= O_TRUNC;
++	if (flags & G_O_APPEND) result |= O_APPEND;
++	if (flags & G_O_NONBLOCK) result |= O_NONBLOCK;
++	if (flags & G_O_DIRECTORY) result |= O_DIRECTORY;
++	return result;
++}
++
++static int guest_open_flags(int flags)
++{
++	int result = flags & O_ACCMODE;
++
++	if (flags & O_APPEND) result |= G_O_APPEND;
++	if (flags & O_NONBLOCK) result |= G_O_NONBLOCK;
++	return result;
++}
++
++static long guest_openat(int dirfd, uint64_t path, int flags, int mode)
++{
++	char resolved[1024];
++	long error = host_path(dirfd, path, resolved, sizeof(resolved));
++
++	if (error)
++		return error;
++	return result_of(open(resolved, host_open_flags(flags), mode));
++}
++
++static long guest_stat_at(int dirfd, uint64_t path, uint64_t result, int flags)
++{
++	char resolved[1024];
++	struct stat information;
++	long error;
++
++	if ((flags & G_AT_EMPTY_PATH) && path && !GUEST(const char *, path)[0])
++	{
++		if (fstat(dirfd, &information) != 0)
++			return guest_error(errno);
++		stat_out(&information, result);
++		return 0;
++	}
++	error = host_path(dirfd, path, resolved, sizeof(resolved));
++	if (error)
++		return error;
++	/* (the PS4 has no lstat or fstatat) */
++	if (stat(resolved, &information) != 0)
++		return guest_error(errno);
++	stat_out(&information, result);
++	return 0;
++}
++
++/* Linux's getdents64 from the PS4's getdents (FreeBSD's entries). A Linux
++entry is at most twice the size of the FreeBSD one it comes from (24 bytes
++for a 12-byte one), so reading half the guest's buffer always fits (musl's
++readdir reads into 2048 bytes; the kernel wants at least 512). */
++static long guest_getdents64(int fd, uint64_t buffer, uint32_t size)
++{
++	char entries[4096];
++	uint8_t *out = GUEST(uint8_t *, buffer);
++	uint32_t used = 0, wanted = (size / 2) & ~511u;
++	int got, offset = 0;
++
++	if (wanted < 512)
++		wanted = 512;
++	if (wanted > sizeof(entries))
++		wanted = sizeof(entries);
++	got = getdents(fd, (struct dirent *)entries, wanted);
++	if (got < 0)
++		return guest_error(errno);
++	while (offset < got)
++	{
++		const struct dirent *entry = (const struct dirent *)(entries + offset);
++		size_t name_length = strnlen(entry->d_name, entry->d_namlen);
++		uint32_t length = (uint32_t)((sizeof(struct guest_dirent64) + name_length + 1 + 7) & ~(size_t)7);
++		struct guest_dirent64 *result;
++
++		if (!entry->d_reclen || used + length > size)
++			break;
++		result = (struct guest_dirent64 *)(out + used);
++		/* (no inode: the PS4's headers spell its field two ways; musl's
++		readdir only wants it nonzero) */
++		result->d_ino = 1 + used;
++		result->d_off = used + length;
++		result->d_reclen = (uint16_t)length;
++		result->d_type = entry->d_type;
++		memcpy(result->d_name, entry->d_name, name_length);
++		result->d_name[name_length] = 0;
++		used += length;
++		offset += entry->d_reclen;
++	}
++	return used;
++}
++
++/* ---------- standard output and error */
++
++struct log_stream
++{
++	char line[1024];
++	size_t length;
++};
++
++static struct log_stream log_streams[2];
++static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
++
++static void log_bytes(int fd, const char *bytes, size_t size)
++{
++	struct log_stream *stream = &log_streams[fd == 2];
++	size_t index;
++
++	pthread_mutex_lock(&log_lock);
++	for (index = 0; index < size; index++)
++	{
++		char c = bytes[index];
++
++		if (c == '\n' || stream->length == sizeof(stream->line) - 1)
++		{
++			stream->line[stream->length] = 0;
++			host_log(fd == 2 ? HOST_LOG_WARN : HOST_LOG_INFO, stream->line);
++			stream->length = 0;
++			if (c == '\n')
++				continue;
++		}
++		stream->line[stream->length++] = c;
++	}
++	pthread_mutex_unlock(&log_lock);
++}
++
++static long guest_rw_vector(int fd, uint64_t vector, int count, int64_t offset, int positional, int writing)
++{
++	const struct guest_iovec *guest_vector = GUEST(const struct guest_iovec *, vector);
++	long total = 0;
++	int index;
++
++	if (count < 0 || count > 1024)
++		return -G_EINVAL;
++	for (index = 0; index < count; index++)
++	{
++		void *base = GUEST(void *, guest_vector[index].base);
++		size_t length = guest_vector[index].length;
++		ssize_t done;
++
++		if (!length)
++			continue;
++		if (writing && (fd == 1 || fd == 2))
++		{
++			log_bytes(fd, base, length);
++			done = (ssize_t)length;
++		}
++		else if (writing)
++		{
++			done = positional ? pwrite(fd, base, length, offset + total) : write(fd, base, length);
++		}
++		else
++		{
++			host_memory_prepare_write((uint64_t)(uintptr_t)base, length);
++			done = positional ? pread(fd, base, length, offset + total) : read(fd, base, length);
++		}
++		if (done < 0)
++			return total ? total : guest_error(errno);
++		total += done;
++		if ((size_t)done < length)
++			break;
++	}
++	return total;
++}
++
++/* ---------- futexes: condition variables in buckets */
++
++#define FUTEX_BUCKETS 64
++
++struct futex_bucket
++{
++	pthread_mutex_t lock;
++	pthread_cond_t condition;
++	int waiters;
++};
++
++static struct futex_bucket futex_buckets[FUTEX_BUCKETS];
++static pthread_once_t futex_once = PTHREAD_ONCE_INIT;
++
++static void futex_initialize(void)
++{
++	int index;
++
++	for (index = 0; index < FUTEX_BUCKETS; index++)
++	{
++		pthread_mutex_init(&futex_buckets[index].lock, NULL);
++		pthread_cond_init(&futex_buckets[index].condition, NULL);
++	}
++}
++
++static struct futex_bucket *futex_bucket(uint64_t address)
++{
++	pthread_once(&futex_once, futex_initialize);
++	return &futex_buckets[((address >> 2) * 2654435761u >> 7) % FUTEX_BUCKETS];
++}
++
++/* deadline: an absolute CLOCK_REALTIME time, or NULL */
++static long futex_wait(uint64_t address, uint32_t value, const struct timespec *deadline)
++{
++	struct futex_bucket *bucket = futex_bucket(address);
++	volatile uint32_t *word = GUEST(volatile uint32_t *, address);
++	long result = 0;
++
++	pthread_mutex_lock(&bucket->lock);
++	if (*word != value)
++	{
++		pthread_mutex_unlock(&bucket->lock);
++		return -G_EAGAIN;
++	}
++	bucket->waiters++;
++	if (deadline)
++	{
++		if (pthread_cond_timedwait(&bucket->condition, &bucket->lock, deadline) == ETIMEDOUT)
++			result = -G_ETIMEDOUT;
++	}
++	else
++	{
++		pthread_cond_wait(&bucket->condition, &bucket->lock);
++	}
++	bucket->waiters--;
++	pthread_mutex_unlock(&bucket->lock);
++	return result;
++}
++
++static long futex_wake(uint64_t address, uint32_t count)
++{
++	struct futex_bucket *bucket = futex_bucket(address);
++	int woken;
++
++	pthread_mutex_lock(&bucket->lock);
++	woken = bucket->waiters;
++	if (woken)
++		pthread_cond_broadcast(&bucket->condition);
++	pthread_mutex_unlock(&bucket->lock);
++	return woken < (int)count ? woken : (int)count;
++}
++
++static long guest_futex(uint64_t address, int operation, uint32_t value, uint64_t timeout, uint64_t address2,
++	uint32_t value3)
++{
++	int command = operation & ~(G_FUTEX_PRIVATE_FLAG | G_FUTEX_CLOCK_REALTIME);
++	struct timespec deadline;
++
++	(void)value3;
++	switch (command)
++	{
++	case G_FUTEX_WAIT:
++	case G_FUTEX_WAIT_BITSET:
++		if (timeout)
++		{
++			struct timespec given;
++
++			timespec_in(timeout, &given);
++			if (command == G_FUTEX_WAIT)
++			{
++				/* relative */
++				clock_gettime(CLOCK_REALTIME, &deadline);
++				deadline.tv_sec += given.tv_sec;
++				deadline.tv_nsec += given.tv_nsec;
++			}
++			else if (operation & G_FUTEX_CLOCK_REALTIME)
++			{
++				deadline = given;
++			}
++			else
++			{
++				/* absolute on the monotonic clock: as far from now in real time */
++				struct timespec now, real;
++
++				clock_gettime(CLOCK_MONOTONIC, &now);
++				clock_gettime(CLOCK_REALTIME, &real);
++				deadline.tv_sec = real.tv_sec + (given.tv_sec - now.tv_sec);
++				deadline.tv_nsec = real.tv_nsec + (given.tv_nsec - now.tv_nsec);
++			}
++			while (deadline.tv_nsec >= 1000000000L)
++			{
++				deadline.tv_sec++;
++				deadline.tv_nsec -= 1000000000L;
++			}
++			while (deadline.tv_nsec < 0)
++			{
++				deadline.tv_sec--;
++				deadline.tv_nsec += 1000000000L;
++			}
++		}
++		return futex_wait(address, value, timeout ? &deadline : NULL);
++	case G_FUTEX_WAKE:
++	case G_FUTEX_WAKE_BITSET:
++		return futex_wake(address, value);
++	case G_FUTEX_REQUEUE:
++	case G_FUTEX_CMP_REQUEUE:
++		/* everyone wakes (and checks again) */
++		if (command == G_FUTEX_CMP_REQUEUE && *GUEST(volatile uint32_t *, address) != value3)
++			return -G_EAGAIN;
++		futex_wake(address2, 0x7fffffff);
++		return futex_wake(address, 0x7fffffff);
++	default:
++		return -G_ENOSYS;
++	}
++}
++
++/* ---------- clocks */
++
++static clockid_t host_clock(int64_t clock)
++{
++	switch (clock)
++	{
++	case 0: /* CLOCK_REALTIME */
++	case 5: /* CLOCK_REALTIME_COARSE */
++		return CLOCK_REALTIME;
++	default:
++		return CLOCK_MONOTONIC;
++	}
++}
++
++/* ---------- dispatch */
++
++long long host_syscall(long long number, long long a, long long b, long long c,
++	long long d, long long e, long long f)
++{
++	switch (number)
++	{
++	case GUEST_SYS_write:
++		if (a == 1 || a == 2)
++		{
++			log_bytes((int)a, GUEST(const char *, b), (size_t)(uint32_t)c);
++			return (uint32_t)c;
++		}
++		return result_of(write((int)a, GUEST(const void *, b), (size_t)(uint32_t)c));
++	case GUEST_SYS_read:
++		host_memory_prepare_write((uint64_t)(uint32_t)b, (uint32_t)c);
++		return result_of(read((int)a, GUEST(void *, b), (size_t)(uint32_t)c));
++	case GUEST_SYS_pread64:
++		host_memory_prepare_write((uint64_t)(uint32_t)b, (uint32_t)c);
++		return result_of(pread((int)a, GUEST(void *, b), (size_t)(uint32_t)c, (off_t)d));
++	case GUEST_SYS_pwrite64:
++		return result_of(pwrite((int)a, GUEST(const void *, b), (size_t)(uint32_t)c, (off_t)d));
++	case GUEST_SYS_writev:
++		return guest_rw_vector((int)a, (uint64_t)b, (int)c, 0, 0, 1);
++	case GUEST_SYS_pwritev:
++		return guest_rw_vector((int)a, (uint64_t)b, (int)c, d, 1, 1);
++	case GUEST_SYS_readv:
++		return guest_rw_vector((int)a, (uint64_t)b, (int)c, 0, 0, 0);
++	case GUEST_SYS_preadv:
++		return guest_rw_vector((int)a, (uint64_t)b, (int)c, d, 1, 0);
++
++	case GUEST_SYS_openat:
++		return guest_openat((int)a, (uint64_t)b, (int)c, (int)d);
++	case GUEST_SYS_close:
++		if (a >= 0 && a <= 2)
++			return 0;
++		return result_of(close((int)a));
++	case GUEST_SYS_lseek:
++		return result_of((long)lseek((int)a, (off_t)b, (int)c));
++	case GUEST_SYS_fstat:
++	{
++		struct stat information;
++
++		if (fstat((int)a, &information) != 0)
++			return guest_error(errno);
++		stat_out(&information, (uint64_t)b);
++		return 0;
++	}
++	case GUEST_SYS_newfstatat:
++		return guest_stat_at((int)a, (uint64_t)b, (uint64_t)c, (int)d);
++	case GUEST_SYS_getdents64:
++		return guest_getdents64((int)a, (uint64_t)b, (uint32_t)c);
++	case GUEST_SYS_mkdirat:
++	{
++		char resolved[1024];
++		long error = host_path((int)a, (uint64_t)b, resolved, sizeof(resolved));
++
++		return error ? error : result_of(mkdir(resolved, (mode_t)c));
++	}
++	case GUEST_SYS_unlinkat:
++	{
++		char resolved[1024];
++		long error = host_path((int)a, (uint64_t)b, resolved, sizeof(resolved));
++
++		if (error)
++			return error;
++		return result_of((c & G_AT_REMOVEDIR) ? rmdir(resolved) : unlink(resolved));
++	}
++	case GUEST_SYS_renameat:
++	case GUEST_SYS_renameat2:
++	{
++		char from[1024], to[1024];
++		long error = host_path((int)a, (uint64_t)b, from, sizeof(from));
++
++		if (!error)
++			error = host_path((int)c, (uint64_t)d, to, sizeof(to));
++		return error ? error : result_of(rename(from, to));
++	}
++	case GUEST_SYS_faccessat:
++	case GUEST_SYS_faccessat2:
++	{
++		char resolved[1024];
++		struct stat information;
++		long error = host_path((int)a, (uint64_t)b, resolved, sizeof(resolved));
++
++		/* (existence only: the game's files are all the app's) */
++		if (error)
++			return error;
++		return stat(resolved, &information) == 0 ? 0 : guest_error(errno);
++	}
++	case GUEST_SYS_readlinkat:
++		return -G_EINVAL;
++	case GUEST_SYS_ftruncate:
++		return result_of(ftruncate((int)a, (off_t)b));
++	case GUEST_SYS_fsync:
++	case GUEST_SYS_fdatasync:
++		return result_of(fsync((int)a));
++	case GUEST_SYS_fcntl:
++		switch ((int)b)
++		{
++		case G_F_GETFD:
++		case G_F_SETFD:
++		case G_F_GETLK:
++		case G_F_SETLK:
++		case G_F_SETLKW:
++			return 0;
++		case G_F_GETFL:
++		{
++			int flags = fcntl((int)a, F_GETFL);
++
++			return flags < 0 ? guest_error(errno) : guest_open_flags(flags);
++		}
++		case G_F_SETFL:
++			return result_of(fcntl((int)a, F_SETFL, host_open_flags((int)c) & (O_NONBLOCK | O_APPEND)));
++		case G_F_DUPFD:
++		case G_F_DUPFD_CLOEXEC:
++			return result_of(fcntl((int)a, F_DUPFD, (int)c));
++		default:
++			return -G_EINVAL;
++		}
++	case GUEST_SYS_dup:
++		return result_of(dup((int)a));
++	case GUEST_SYS_dup3:
++		return result_of(dup2((int)a, (int)b));
++	case GUEST_SYS_getcwd:
++	{
++		size_t length;
++
++		pthread_mutex_lock(&working_directory_lock);
++		length = strlen(working_directory) + 1;
++		if (length > (uint32_t)b)
++		{
++			pthread_mutex_unlock(&working_directory_lock);
++			return -G_ERANGE;
++		}
++		memcpy(GUEST(char *, a), working_directory, length);
++		pthread_mutex_unlock(&working_directory_lock);
++		return (long)length;
++	}
++	case GUEST_SYS_chdir:
++	{
++		char resolved[1024];
++		struct stat information;
++		long error = host_path(G_AT_FDCWD, (uint64_t)a, resolved, sizeof(resolved));
++
++		if (error)
++			return error;
++		if (stat(resolved, &information) != 0)
++			return guest_error(errno);
++		if (!S_ISDIR(information.st_mode))
++			return -G_ENOTDIR;
++		pthread_mutex_lock(&working_directory_lock);
++		snprintf(working_directory, sizeof(working_directory), "%s", resolved);
++		pthread_mutex_unlock(&working_directory_lock);
++		return 0;
++	}
++	case GUEST_SYS_utimensat:
++	case GUEST_SYS_fchmod:
++	case GUEST_SYS_fchmodat:
++	case GUEST_SYS_flock:
++	case GUEST_SYS_umask:
++		return 0;
++
++	case GUEST_SYS_clock_gettime:
++	{
++		struct timespec value;
++
++		if (clock_gettime(host_clock(a), &value) != 0)
++			return guest_error(errno);
++		timespec_out((uint64_t)b, &value);
++		return 0;
++	}
++	case GUEST_SYS_clock_getres:
++	{
++		struct timespec value = { 0, 1000 };
++
++		timespec_out((uint64_t)b, &value);
++		return 0;
++	}
++	case GUEST_SYS_gettimeofday:
++	{
++		struct timespec value;
++		struct guest_timespec *result = GUEST(struct guest_timespec *, a);
++
++		clock_gettime(CLOCK_REALTIME, &value);
++		if (result)
++		{
++			result->seconds = (int32_t)value.tv_sec;
++			result->nanoseconds = (int32_t)(value.tv_nsec / 1000);
++		}
++		return 0;
++	}
++	case GUEST_SYS_nanosleep:
++	case GUEST_SYS_clock_nanosleep:
++	{
++		struct timespec request;
++		uint64_t given = number == GUEST_SYS_nanosleep ? (uint64_t)a : (uint64_t)c;
++
++		if (!timespec_in(given, &request))
++			return -G_EFAULT;
++		if (number == GUEST_SYS_clock_nanosleep && (b & 1))
++		{
++			/* TIMER_ABSTIME: until then */
++			struct timespec now;
++
++			clock_gettime(host_clock(a), &now);
++			request.tv_sec -= now.tv_sec;
++			request.tv_nsec -= now.tv_nsec;
++			if (request.tv_nsec < 0)
++			{
++				request.tv_sec--;
++				request.tv_nsec += 1000000000L;
++			}
++			if (request.tv_sec < 0)
++				return 0;
++		}
++		nanosleep(&request, NULL);
++		return 0;
++	}
++	case GUEST_SYS_futex:
++		return guest_futex((uint64_t)a, (int)b, (uint32_t)c, (uint64_t)d, (uint64_t)e, (uint32_t)f);
++	case GUEST_SYS_ppoll:
++	{
++		struct timespec timeout;
++		int milliseconds = -1;
++
++		if (timespec_in((uint64_t)c, &timeout))
++			milliseconds = (int)(timeout.tv_sec * 1000 + timeout.tv_nsec / 1000000);
++		return result_of(poll(GUEST(struct pollfd *, a), (nfds_t)(uint32_t)b, milliseconds));
++	}
++	case GUEST_SYS_sched_yield:
++		return result_of(sched_yield());
++	case GUEST_SYS_getrandom:
++	{
++		uint8_t *buffer = GUEST(uint8_t *, a);
++		uint32_t size = (uint32_t)b, done = 0;
++
++		while (done < size)
++		{
++			uint32_t part = size - done < 256 ? size - done : 256;
++
++			if (getentropy(buffer + done, part) != 0)
++				return done ? (long)done : -G_EIO;
++			done += part;
++		}
++		return (long)size;
++	}
++
++	case GUEST_SYS_mmap:
++		return host_guest_mmap((uint64_t)(uint32_t)a, (uint64_t)(uint32_t)b, (int)c, (int)d, (int)e, f);
++	case GUEST_SYS_munmap:
++		return host_guest_munmap((uint64_t)(uint32_t)a, (uint64_t)(uint32_t)b);
++	case GUEST_SYS_mprotect:
++		return host_guest_mprotect((uint64_t)(uint32_t)a, (uint64_t)(uint32_t)b, (int)c);
++	case GUEST_SYS_madvise:
++	case GUEST_SYS_membarrier:
++		return 0;
++	case GUEST_SYS_mremap:
++	case GUEST_SYS_brk:
++		/* musl then falls back to mmap and copying */
++		return -G_ENOMEM;
++
++	case GUEST_SYS_exit:
++	case GUEST_SYS_exit_group:
++		host_exit((int)a);
++
++	case GUEST_SYS_set_tid_address:
++	case GUEST_SYS_gettid:
++		return host_thread_id();
++	case GUEST_SYS_getpid:
++	case GUEST_SYS_getppid:
++		return 1;
++	case GUEST_SYS_getuid:
++	case GUEST_SYS_geteuid:
++	case GUEST_SYS_getgid:
++	case GUEST_SYS_getegid:
++		return 0;
++	case GUEST_SYS_kill:
++	case GUEST_SYS_tkill:
++	case GUEST_SYS_tgkill:
++	{
++		int signal_number = (int)(number == GUEST_SYS_tgkill ? c : b);
++		char reason[64];
++
++		if (!signal_number)
++			return 0;
++		snprintf(reason, sizeof(reason), "the game raised signal %d%s", signal_number,
++			signal_number == G_SIGABRT ? " (abort)" : "");
++		host_abort(reason);
++	}
++	case GUEST_SYS_rt_sigaction:
++	case GUEST_SYS_rt_sigprocmask:
++	case GUEST_SYS_sigaltstack:
++		/* the host owns signal handling */
++		return 0;
++	case GUEST_SYS_ioctl:
++		return -G_ENOTTY;
++	case GUEST_SYS_uname:
++	{
++		struct guest_utsname *result = GUEST(struct guest_utsname *, a);
++
++		memset(result, 0, sizeof(*result));
++		strcpy(result->sysname, "Linux");
++		strcpy(result->nodename, "ps4");
++		strcpy(result->release, "6.0.0");
++		strcpy(result->version, "OpenCE PS4");
++		strcpy(result->machine, "x86_64");
++		return 0;
++	}
++	case GUEST_SYS_sysinfo:
++	{
++		struct guest_sysinfo *result = GUEST(struct guest_sysinfo *, a);
++		uint64_t free_bytes = host_direct_memory_free();
++
++		memset(result, 0, sizeof(*result));
++		result->mem_unit = 4096;
++		result->totalram = (uint32_t)((4ULL << 30) / 4096);
++		result->freeram = (uint32_t)(free_bytes / 4096);
++		result->procs = 16;
++		return 0;
++	}
++	case GUEST_SYS_sched_getaffinity:
++	{
++		uint8_t *mask = GUEST(uint8_t *, c);
++		uint32_t size = (uint32_t)b < 8 ? (uint32_t)b : 8;
++
++		if (!size)
++			return -G_EINVAL;
++		memset(mask, 0, size);
++		/* the game's cores of the PS4's seven */
++		mask[0] = 0x3f;
++		return size;
++	}
++	case GUEST_SYS_prlimit64:
++	case GUEST_SYS_getrlimit:
++	{
++		/* everything unlimited */
++		uint64_t address = (uint64_t)(number == GUEST_SYS_prlimit64 ? d : b);
++
++		if (address)
++		{
++			if (number == GUEST_SYS_prlimit64)
++			{
++				uint64_t *limits = GUEST(uint64_t *, address);
++
++				limits[0] = limits[1] = ~0ULL;
++			}
++			else
++			{
++				uint32_t *limits = GUEST(uint32_t *, address);
++
++				limits[0] = limits[1] = ~0u;
++			}
++		}
++		return 0;
++	}
++	case GUEST_SYS_statx:
++	case GUEST_SYS_statfs:
++	case GUEST_SYS_fstatfs:
++	case GUEST_SYS_clone:
++	case GUEST_SYS_clone3:
++	case GUEST_SYS_execve:
++	case GUEST_SYS_pipe2:
++	case GUEST_SYS_rt_sigtimedwait:
++	case GUEST_SYS_pselect6:
++	case GUEST_SYS_epoll_pwait:
++	case GUEST_SYS_sendmsg:
++	case GUEST_SYS_recvmsg:
++	case GUEST_SYS_timer_create:
++	case GUEST_SYS_timer_settime:
++	case GUEST_SYS_timer_gettime:
++	case GUEST_SYS_setitimer:
++	case GUEST_SYS_getitimer:
++	case GUEST_SYS_times:
++	case GUEST_SYS_getrusage:
++	case GUEST_SYS_wait4:
++	case GUEST_SYS_waitid:
++		return -G_ENOSYS;
++
++	default:
++		host_logf(HOST_LOG_WARN, "guest system call %lld is not supported", number);
++		return -G_ENOSYS;
++	}
++}
+diff --git a/port/ps4/host/host_thread.c b/port/ps4/host/host_thread.c
+new file mode 100644
+index 00000000..9845d0e4
+--- /dev/null
++++ b/port/ps4/host/host_thread.c
+@@ -0,0 +1,217 @@
++/*
++HOST_THREAD.C
++
++Threads that run guest code (Android's host_thread.c, for the PS4).
++
++Guest (x32) code keeps stack addresses in 32-bit registers, so every thread
++that runs it needs its stack in guest memory: every such thread is created
++here, with its stack given to pthread_create. On the PS4 that also spares the
++threads the 8 MB stacks the system would take from flexible memory (the SMW
++port's v00.01 ran out of it). The guest's thread pointer (its musl struct
++pthread) is kept per thread in host TLS. Thread stacks are freed by a reaper
++thread once the thread has fully exited.
++*/
++
++#include "host.h"
++
++#include <errno.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <unistd.h>
++
++int32_t ps4_pthread_rename(void *thread, const char *name) __asm__("scePthreadRename");
++void *ps4_pthread_self(void) __asm__("scePthreadSelf");
++
++#define GUARD_SIZE 0x4000
++
++static __thread uint32_t guest_tp;
++static __thread int thread_id;
++static int next_thread_id = 1;
++
++uint32_t host_get_tp(void)
++{
++	return guest_tp;
++}
++
++void host_set_tp(uint32_t thread)
++{
++	guest_tp = thread;
++}
++
++int host_thread_id(void)
++{
++	if (!thread_id)
++		thread_id = __sync_fetch_and_add(&next_thread_id, 1);
++	return thread_id;
++}
++
++/* ---------- stacks */
++
++static void *stack_allocate(size_t size, void **mapping, size_t *mapping_size)
++{
++	size_t total = size + GUARD_SIZE;
++	void *base = host_low_map(total, PROT_READ | PROT_WRITE);
++
++	if (!base)
++		return NULL;
++	/* guard page at the bottom (a PS4 page: 16 KB) */
++	mprotect(base, GUARD_SIZE, PROT_NONE);
++	*mapping = base;
++	*mapping_size = total;
++	return (char *)base + GUARD_SIZE;
++}
++
++static int on_guest_stack(void)
++{
++	uint64_t sp = (uint64_t)(uintptr_t)__builtin_frame_address(0);
++
++	return sp < 0x100000000ULL;
++}
++
++/* ---------- calling into the guest */
++
++typedef uint32_t (*guest_function)(uint32_t, uint32_t, uint32_t, uint32_t);
++
++uint32_t host_call_guest(uint32_t function, uint32_t a, uint32_t b, uint32_t c, uint32_t d)
++{
++	if (!on_guest_stack())
++		host_fatal("guest code called on a thread without a guest stack");
++	if (!guest_tp)
++		((guest_function)(uintptr_t)host_image.header->thread_attach)(0, 0, 0, 0);
++	return ((guest_function)(uintptr_t)function)(a, b, c, d);
++}
++
++void host_run_guest_main(uint32_t boot)
++{
++	((void (*)(uint32_t))(uintptr_t)host_image.header->start)(boot);
++	host_fatal("the guest returned from __guest_start");
++}
++
++/* ---------- guest threads */
++
++struct thread_start
++{
++	void *(*function)(void *);
++	void *argument;
++	void *mapping;
++	size_t mapping_size;
++	char name[32];
++};
++
++struct finished_thread
++{
++	struct finished_thread *next;
++	pthread_t thread;
++	void *mapping;
++	size_t mapping_size;
++};
++
++static pthread_mutex_t reaper_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t reaper_condition = PTHREAD_COND_INITIALIZER;
++static struct finished_thread *finished_threads;
++static int reaper_started;
++
++static void *reaper(void *unused)
++{
++	(void)unused;
++	for (;;)
++	{
++		struct finished_thread *finished;
++
++		pthread_mutex_lock(&reaper_lock);
++		while (!finished_threads)
++			pthread_cond_wait(&reaper_condition, &reaper_lock);
++		finished = finished_threads;
++		finished_threads = finished->next;
++		pthread_mutex_unlock(&reaper_lock);
++		pthread_join(finished->thread, NULL);
++		host_low_unmap(finished->mapping, finished->mapping_size);
++		free(finished);
++	}
++	return NULL;
++}
++
++static void *thread_main(void *context)
++{
++	struct thread_start start = *(struct thread_start *)context;
++	struct finished_thread *finished;
++
++	free(context);
++	if (start.name[0])
++		ps4_pthread_rename(ps4_pthread_self(), start.name);
++	host_debug_thread_started(start.name);
++	start.function(start.argument);
++	/* (a thread the guest made has let its struct pthread go by now; one
++	of the host's that ran guest code, the audio thread, has it still) */
++	if (guest_tp)
++		((guest_function)(uintptr_t)host_image.header->thread_detach)(0, 0, 0, 0);
++	host_debug_thread_exited();
++	guest_tp = 0;
++
++	finished = calloc(1, sizeof(*finished));
++	finished->thread = pthread_self();
++	finished->mapping = start.mapping;
++	finished->mapping_size = start.mapping_size;
++	pthread_mutex_lock(&reaper_lock);
++	finished->next = finished_threads;
++	finished_threads = finished;
++	pthread_cond_signal(&reaper_condition);
++	pthread_mutex_unlock(&reaper_lock);
++	return NULL;
++}
++
++int host_native_thread_create(void *(*function)(void *), void *argument, size_t stack_size, const char *name)
++{
++	struct thread_start *start = calloc(1, sizeof(*start));
++	pthread_attr_t attributes;
++	pthread_t thread;
++	void *stack;
++	int error;
++
++	if (!start)
++		return ENOMEM;
++	pthread_mutex_lock(&reaper_lock);
++	if (!reaper_started)
++	{
++		pthread_t reaper_thread;
++
++		if (pthread_create(&reaper_thread, NULL, reaper, NULL) == 0)
++			reaper_started = 1;
++	}
++	pthread_mutex_unlock(&reaper_lock);
++
++	stack_size = (stack_size + 0xffff) & ~(size_t)0xffff;
++	stack = stack_allocate(stack_size, &start->mapping, &start->mapping_size);
++	if (!stack)
++	{
++		free(start);
++		return EAGAIN;
++	}
++	start->function = function;
++	start->argument = argument;
++	snprintf(start->name, sizeof(start->name), "%s", name ? name : "");
++	pthread_attr_init(&attributes);
++	pthread_attr_setstack(&attributes, stack, stack_size);
++	error = pthread_create(&thread, &attributes, thread_main, start);
++	pthread_attr_destroy(&attributes);
++	if (error)
++	{
++		host_logf(HOST_LOG_ERROR, "cannot start thread %s (%d)", start->name, error);
++		host_low_unmap(start->mapping, start->mapping_size);
++		free(start);
++	}
++	return error;
++}
++
++static void *guest_thread_main(void *guest_thread)
++{
++	host_call_guest(host_image.header->thread_start, (uint32_t)(uintptr_t)guest_thread, 0, 0, 0);
++	return NULL;
++}
++
++int host_thread_create(uint32_t guest_thread, uint32_t stack_size)
++{
++	return host_native_thread_create(guest_thread_main, (void *)(uintptr_t)guest_thread, stack_size, "guest");
++}
+diff --git a/port/ps4/host_imports.list b/port/ps4/host_imports.list
+new file mode 100644
+index 00000000..026e2aa5
+--- /dev/null
++++ b/port/ps4/host_imports.list
+@@ -0,0 +1,58 @@
++# Host functions the PS4 guest imports (declared in port/android/guest/runtime/guest_host.h,
++# defined in port/ps4/host). tools/android_imports.py generates the stubs.
++host_syscall
++host_log
++host_abort
++host_exit
++host_errno
++host_get_tp
++host_set_tp
++host_thread_create
++host_memory_watch_initialize
++host_memory_watch_protect
++host_memory_watch_generation
++host_memory_watch_serial
++host_memory_watch_prepare_write
++host_memory_watch_forget
++host_memory_watch_begin_frame
++host_sdl_init
++host_sdl_set_hint
++host_sdl_get_error
++host_sdl_ticks
++host_sdl_thread_id
++host_sdl_create_window
++host_sdl_window_size_in_pixels
++host_sdl_set_relative_mouse
++host_sdl_gl_set_attribute
++host_sdl_gl_create_context
++host_sdl_gl_make_current
++host_sdl_gl_set_swap_interval
++host_sdl_gl_swap_window
++host_sdl_poll_event
++host_sdl_set_clipboard_text
++host_sdl_get_clipboard_text
++host_sdl_show_toast
++host_sdl_show_simple_message_box
++host_sdl_show_message_box
++host_sdl_get_gamepads
++host_sdl_open_gamepad
++host_sdl_gamepad_from_id
++host_sdl_gamepad_axis
++host_sdl_gamepad_button
++host_sdl_gamepad_type
++host_sdl_rumble_gamepad
++host_sdl_close_gamepad
++host_sdl_scancode_name
++host_sdl_scancode_from_name
++host_sdl_open_audio_stream
++host_sdl_put_audio_stream_data
++host_sdl_resume_audio_stream_device
++host_sdl_get_audio_stream_data
++host_sdl_get_audio_stream_available
++host_sdl_destroy_audio_stream
++host_gl_get_string
++host_gl_has_extension
++host_gl_read_buffer
++host_gl_buffer_write
++host_gl_fence_frame
++host_gl_wait_frame
+diff --git a/source/cseries/stack_walk_windows.c b/source/cseries/stack_walk_windows.c
+index ed43d437..2bafdda1 100644
+--- a/source/cseries/stack_walk_windows.c
++++ b/source/cseries/stack_walk_windows.c
+@@ -346,6 +346,10 @@ void stack_walk_with_context(
+ 			/* the call site (the BL before the return address), for
+ 			llvm-symbolizer --obj=build/android/halo_guest.elf */
+ 			unsigned long routine_address = routine_addresses[frame_number] - 4;
++#elif defined(HALO_X32_GUEST)
++			/* port: inside the call before the return address (x86 calls
++			vary in length), for llvm-symbolizer --obj=build/ps4/halo_guest.elf */
++			unsigned long routine_address = routine_addresses[frame_number] - 1;
+ #else
+ 			unsigned long routine_address = routine_addresses[frame_number] + *(long *)(routine_addresses[frame_number] - sizeof(long));
+ #endif
+@@ -734,9 +738,10 @@ static unsigned long walk_up(
+ 
+ 	if (walk_up_current_frame)
+ 	{
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST)
+ 		/* an AArch64 frame record: the caller's frame pointer, then the
+-		return address, 8 bytes each (the upper halves are zero) */
++		return address, 8 bytes each (the upper halves are zero); port: x86-64's
++		(x32's) push the same two */
+ 		routine_address = ((unsigned long *)walk_up_current_frame)[2];
+ #else
+ 		routine_address = ((unsigned long *)walk_up_current_frame)[1];
+diff --git a/source/hs/hs.c b/source/hs/hs.c
+index a76dee3c..6a63523a 100644
+--- a/source/hs/hs.c
++++ b/source/hs/hs.c
+@@ -14703,7 +14703,7 @@ static void player_effect_screen_fade_in_evaluate(
+ 		double value1 = arguments->value1;
+ 		double value2 = arguments->value2;
+ 
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST) /* port: floats in their own registers (x86-64 too) */
+ 		player_effect_screen_fade_in(*(real const *)&arguments->value0, (real)value1, (real)value2, arguments->value3);
+ #else
+ 		player_effect_screen_fade_in(arguments->value0, value1, value2, arguments->value3);
+@@ -14726,7 +14726,7 @@ static void player_effect_screen_fade_out_evaluate(
+ 		double value1 = arguments->value1;
+ 		double value2 = arguments->value2;
+ 
+-#ifdef HALO_ARM64_GUEST
++#if defined(HALO_ARM64_GUEST) || defined(HALO_X32_GUEST) /* port: floats in their own registers (x86-64 too) */
+ 		player_effect_screen_fade_out(*(real const *)&arguments->value0, (real)value1, (real)value2, arguments->value3);
+ #else
+ 		player_effect_screen_fade_out(arguments->value0, value1, value2, arguments->value3);
+diff --git a/tools/android_gl_stubs.py b/tools/android_gl_stubs.py
+index c28a0f0b..e30815d1 100644
+--- a/tools/android_gl_stubs.py
++++ b/tools/android_gl_stubs.py
+@@ -16,7 +16,11 @@ guest wrapper that widens such arguments and calls an import named
+ hostgl_<function>, which the host resolves to the real entry point. Functions
+ returning a string go through host_gl_get_string instead.
+ 
+-Usage: android_gl_stubs.py gl.h gl32.h gl2ext.h output.c imports.list
++Usage: android_gl_stubs.py [--integer-registers N] gl.h gl32.h gl2ext.h output.c imports.list
++
++--integer-registers: the integer argument registers of the guest's ABI, 8 on
++AArch64 (the default), 6 on x86-64 (the PS4 port's x32 guest, whose stack
++arguments also take 8-byte slots).
+ """
+ 
+ import re
+@@ -55,7 +59,12 @@ def split_parameter(param: str):
+ 
+ 
+ def main():
+-    gl_header, gl32, gl2ext, output, imports = sys.argv[1:6]
++    global INTEGER_REGISTER_COUNT
++    arguments = sys.argv[1:]
++    if arguments[0] == "--integer-registers":
++        INTEGER_REGISTER_COUNT = int(arguments[1])
++        arguments = arguments[2:]
++    gl_header, gl32, gl2ext, output, imports = arguments[:5]
+     functions = android_functions(gl_header)
+     protos = prototypes(gl32, gl2ext)
+     out = [
+diff --git a/tools/android_imports.py b/tools/android_imports.py
+index 308fe1fa..41aab3de 100644
+--- a/tools/android_imports.py
++++ b/tools/android_imports.py
+@@ -7,11 +7,14 @@ host's 64-bit function address from __host_import_table and branches to it.
+ The arguments are left untouched in their registers; the host fills in the
+ table when it loads the image (port/android/host/host_loader.c).
+ 
+-Usage: android_imports.py [--host-table table.c] output.s list...
++Usage: android_imports.py [--arch aarch64|x86_64] [--host-table table.c] output.s list...
+ 
+ With --host-table, also writes the host's name-to-function table for the
+ names in the lists (OpenGL names, which the host resolves at run time, are
+ not part of it).
++
++--arch x86_64 writes the stubs of the PS4 port's x32 guest: an indirect jump
++through the table, whose 64-bit entries x32 code can jump to.
+ """
+ 
+ import sys
+@@ -20,8 +23,14 @@ import sys
+ def main():
+     arguments = sys.argv[1:]
+     host_table = None
+-    if arguments[0] == "--host-table":
+-        host_table = arguments[1]
++    arch = "aarch64"
++    while arguments[0].startswith("--"):
++        if arguments[0] == "--host-table":
++            host_table = arguments[1]
++        elif arguments[0] == "--arch":
++            arch = arguments[1]
++        else:
++            raise SystemExit(f"unknown option {arguments[0]}")
+         arguments = arguments[2:]
+     output, lists = arguments[0], arguments[1:]
+     names = []
+@@ -33,6 +42,15 @@ def main():
+     out = ["/* generated by tools/android_imports.py; do not edit */", "\t.text"]
+     for index, name in enumerate(names):
+         offset = index * 8
++        if arch == "x86_64":
++            out += [
++                f"\t.globl {name}",
++                f"\t.type {name},@function",
++                "\t.p2align 4",
++                f"{name}:",
++                f"\tjmpq *__host_import_table+{offset}(%rip)",
++            ]
++            continue
+         out += [
+             f"\t.globl {name}",
+             f"\t.type {name},%function",
+diff --git a/tools/ps4_build.py b/tools/ps4_build.py
+new file mode 100644
+index 00000000..a6076e62
+--- /dev/null
++++ b/tools/ps4_build.py
+@@ -0,0 +1,381 @@
++"""Ninja rules for the PS4 build's guest (``ninja ps4``).
++
++The PS4 port (port/ps4/README.md) runs the game as the Android port does
++(port/android/README.md): as ILP32 code, 32-bit pointers as the game's data
++formats require, inside a 64-bit process. On the PS4's x86-64 that is x32
++code: 64-bit instructions with 32-bit pointers, which clang compiles for
++x86_64-linux-gnux32. This graph builds
++
++- the guest image, build/ps4/halo_guest.elf: the game sources, the platform
++  layer shared with the Linux port (port/linux/src) and the guest runtime the
++  Android port's guest uses too (port/android/guest/runtime) with a subset of
++  musl as its C library (its x32 arch in port/ps4/guest/libc), linked at a
++  fixed address below 4 GB;
++- the host's generated sources, build/ps4/host: its import table and the
++  guest's system call numbers.
++
++The host itself (port/ps4/host), a PS4 executable, is built with the PS4
++toolchain outside this graph (port/ps4/README.md).
++"""
++
++import subprocess
++import sys
++from pathlib import Path
++from typing import Any, Dict, List
++
++from .android_build import (EXPAT_DIR, EXPAT_SOURCES, KCP_DIR, MONOCYPHER_DIR, MUSL_DIRECTORIES, MUSL_EXCLUDE,
++                            MUSL_FILES, MUSL_SHA256, MUSL_THREAD_PREFIXES, MUSL_URL, MUSL_VERSION, SDL_COMMIT, SDL_TAG,
++                            SDL_URL, TOML_DIR, VARIADIC_PROTOTYPE_FILES, ZLIB_DEFINES, ZLIB_DIR, ZLIB_SOURCES)
++from .linux_build import (MUSL_MATH_DIR, STB_VORBIS_SOURCE, XDK_INCLUDE, compile_launcher, configuration_defines,
++                          game_defines_and_includes, game_sources, musl_math_sources, opus_cflags, opus_sources,
++                          updater_defines, xdk_headers)
++from .embed_assets import hud_assets_build, hud_configure_inputs
++from .ninja_syntax import Writer
++
++PORT_DIR = Path("port/ps4")
++ANDROID_DIR = Path("port/android")
++LINUX_DIR = Path("port/linux")
++BUILD = Path("build/ps4")
++THIRD_PARTY = BUILD / "third_party"
++MUSL_DIR = THIRD_PARTY / f"musl-{MUSL_VERSION}"
++SDL_DIR = THIRD_PARTY / "SDL3"
++
++# The guest ABI: x32. musl is the C library; the process is the PS4's, whose
++# kernel the guest never calls (its system calls go to the host).
++GUEST_ABI_FLAGS = [
++    "--target=x86_64-linux-gnux32",
++    # the ILP32 guest's code paths, the OpenGL ES renderer's, and the
++    # console's (in the port's sources, each its own macro)
++    "-DHALO_X32_GUEST=1",
++    "-DHALO_GLES=1",
++    "-DHALO_PS4=1",
++    # the PS4's AMD Jaguar (SSE4.2, AVX, F16C, no AVX2)
++    "-march=btver2",
++    "-nostdinc",
++    "-fshort-wchar",
++    "-fno-stack-protector",
++    "-fno-unwind-tables",
++    "-fno-asynchronous-unwind-tables",
++    "-femulated-tls",
++    # RIP-relative addressing: the image runs above 2 GB
++    "-fPIE",
++    # no fused multiply-add: the game was written for x87/SSE arithmetic
++    # (as the Android guest)
++    "-ffp-contract=off",
++    "-O2",
++]
++
++# as the Linux build (tools/linux_build.py), minus what only 32-bit x86 needs
++GUEST_CODE_FLAGS = [
++    "-fms-extensions",
++    "-fcommon",
++    "-fno-strict-aliasing",
++    "-fwrapv",
++    "-fno-delete-null-pointer-checks",
++    "-fno-omit-frame-pointer",
++    *(f"-fno-builtin-{name}" for name in (
++        "wcslen", "wcsnlen", "wcschr", "wcsrchr", "wcscmp", "wcsncmp", "wcscpy",
++        "wcsncpy", "wcscat", "wcsncat", "wmemchr", "wmemcmp", "wmemcpy",
++        "wmemmove", "wmemset",
++    )),
++]
++
++
++def fetch_third_party() -> None:
++    """Download musl and SDL3's headers (configure time, once)."""
++    import hashlib
++    THIRD_PARTY.mkdir(parents=True, exist_ok=True)
++    if not MUSL_DIR.is_dir():
++        print(f"Downloading {MUSL_URL}")
++        archive = THIRD_PARTY / f"musl-{MUSL_VERSION}.tar.gz"
++        subprocess.run(["curl", "-sSfL", "-o", str(archive), MUSL_URL], check=True)
++        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
++        if digest != MUSL_SHA256:
++            archive.unlink()
++            raise SystemExit(f"{MUSL_URL}: SHA-256 {digest}, not the pinned {MUSL_SHA256}")
++        subprocess.run(["tar", "xzf", archive.name], cwd=THIRD_PARTY, check=True)
++        archive.unlink()
++    if not SDL_DIR.is_dir():
++        print(f"Cloning SDL3 {SDL_TAG} (its headers)")
++        subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", SDL_TAG, SDL_URL, str(SDL_DIR)],
++                       check=True)
++        commit = subprocess.run(["git", "-C", str(SDL_DIR), "rev-parse", "HEAD"], capture_output=True, text=True,
++                                check=True).stdout.strip()
++        if commit != SDL_COMMIT:
++            raise SystemExit(f"SDL3 {SDL_TAG} is {commit}, not the pinned {SDL_COMMIT}")
++
++
++def _musl_sources() -> List[Path]:
++    """The Android guest's subset of musl (tools/android_build.py), from this
++    build's copy."""
++    src = MUSL_DIR / "src"
++    result = set()
++    for directory in MUSL_DIRECTORIES:
++        for path in (src / directory).glob("*.c"):
++            result.add(path)
++    for name in MUSL_FILES:
++        result.add(src / name)
++    for path in (src / "thread").glob("*.c"):
++        if path.name.startswith(MUSL_THREAD_PREFIXES):
++            result.add(path)
++    sources = []
++    for path in sorted(result):
++        relative = path.relative_to(src).as_posix()
++        if relative in MUSL_EXCLUDE or any(relative.startswith(e + "/") for e in MUSL_EXCLUDE):
++            continue
++        sources.append(path)
++    return sources
++
++
++def ps4_configure_inputs() -> List[Path]:
++    return [Path(__file__), PORT_DIR / "guest", PORT_DIR / "host", ANDROID_DIR / "guest" / "runtime",
++            LINUX_DIR / "src", *hud_configure_inputs()]
++
++
++def generate_ps4_build(n: Writer, sln: Any) -> None:
++    gl_include_root = getattr(sln, "ps4_gl_include", None)
++    config_path = LINUX_DIR / "port.json"
++    if not gl_include_root or not config_path.is_file():
++        n.comment("PS4 build: pass --ps4-gl-include (the Khronos OpenGL ES headers, such as Mesa's include/)")
++        return
++    gl_include_root = Path(gl_include_root)
++    if not (gl_include_root / "GLES3" / "gl32.h").is_file():
++        print(f"PS4 build disabled: no GLES3/gl32.h in {gl_include_root}", file=sys.stderr)
++        return
++    try:
++        fetch_third_party()
++    except (subprocess.CalledProcessError, OSError) as error:
++        print(f"PS4 build disabled: cannot fetch musl/SDL3 ({error})", file=sys.stderr)
++        return
++    import json
++    config: Dict[str, Any] = json.loads(config_path.read_text(encoding="utf-8"))
++
++    guest_cc = getattr(sln, "ps4_guest_cc", None) or "clang"
++    guest_dir = BUILD / "guest"
++    obj_dir = guest_dir / "obj"
++    gen_dir = guest_dir / "gen"
++    host_gen = BUILD / "host"
++    libc_include = guest_dir / "libc_include"
++    libc_internal = guest_dir / "libc_internal"
++    arch = PORT_DIR / "guest" / "libc" / "arch" / "x32_guest"
++    runtime_dir = ANDROID_DIR / "guest" / "runtime"
++    semantics_header = Path("build/linux/halo_msvc_semantics.h")
++    platform_semantics_header = Path("build/linux/platform_msvc_semantics.h")
++    prefix_header = LINUX_DIR / "include" / "halo_linux_prefix.h"
++    image = BUILD / "halo_guest.elf"
++    python = "$python"
++
++    n.comment("PS4 build (ninja ps4): the guest image; see port/ps4/README.md")
++    n.variable("ps4_guest_cc", guest_cc)
++    n.variable("ps4_guest_ld", getattr(sln, "ps4_guest_ld", None) or "ld.lld")
++    n.variable("ps4_guest_ar", getattr(sln, "ps4_guest_ar", None) or "llvm-ar")
++
++    # ---------- generated headers and sources
++
++    alltypes = libc_include / "bits" / "alltypes.h"
++    syscall_h = libc_include / "bits" / "syscall.h"
++    version_h = libc_internal / "version.h"
++    n.rule(name="ps4_alltypes", command=f"sed -f {MUSL_DIR}/tools/mkalltypes.sed $in > $out",
++           description="PS4 MUSL $out")
++    n.build(outputs=alltypes, rule="ps4_alltypes",
++            inputs=[arch / "bits" / "alltypes.h.in", MUSL_DIR / "include" / "alltypes.h.in"])
++    n.rule(name="ps4_syscall_h", command="cp $in $out && sed -n -e s/__NR_/SYS_/p < $in >> $out",
++           description="PS4 MUSL $out")
++    n.build(outputs=syscall_h, rule="ps4_syscall_h", inputs=arch / "bits" / "syscall.h.in")
++    # the same numbers for the host, which translates them (port/ps4/host/host_syscall.c), named apart from
++    # its own system's
++    host_syscall_h = host_gen / "guest_syscall_numbers.h"
++    n.rule(name="ps4_host_syscall_h", command="sed -n -e 's/^#define __NR_/#define GUEST_SYS_/p' < $in > $out",
++           description="PS4 HOST $out")
++    n.build(outputs=host_syscall_h, rule="ps4_host_syscall_h", inputs=arch / "bits" / "syscall.h.in")
++    n.rule(name="ps4_version_h", command=f"echo '#define VERSION \"{MUSL_VERSION}\"' > $out",
++           description="PS4 MUSL $out")
++    n.build(outputs=version_h, rule="ps4_version_h")
++
++    gl32 = gl_include_root / "GLES3" / "gl32.h"
++    gl2ext = gl_include_root / "GLES2" / "gl2ext.h"
++    guest_gl_c = gen_dir / "guest_gl.c"
++    gl_imports = gen_dir / "gl_imports.list"
++    n.rule(
++        name="ps4_gl_stubs",
++        # (six integer argument registers on x86-64)
++        command=(f"{python} tools/android_gl_stubs.py --integer-registers 6 {LINUX_DIR}/src/gl.h {gl32} {gl2ext} "
++                 f"{guest_gl_c} {gl_imports}"),
++        description="PS4 GL STUBS",
++    )
++    n.build(outputs=[guest_gl_c, gl_imports], rule="ps4_gl_stubs",
++            implicit=[Path("tools/android_gl_stubs.py"), LINUX_DIR / "src" / "gl.h"])
++
++    guest_posix_c = gen_dir / "guest_posix.c"
++    posix_imports = gen_dir / "posix_imports.list"
++    n.rule(name="ps4_posix_stubs",
++           command=f"{python} tools/android_posix_stubs.py {LINUX_DIR}/src/posix.h {guest_posix_c} {posix_imports}",
++           description="PS4 POSIX STUBS")
++    n.build(outputs=[guest_posix_c, posix_imports], rule="ps4_posix_stubs",
++            implicit=[Path("tools/android_posix_stubs.py"), LINUX_DIR / "src" / "posix.h"])
++
++    imports_s = gen_dir / "imports.s"
++    host_table_c = host_gen / "host_import_table.c"
++    n.rule(
++        name="ps4_imports",
++        command=f"{python} tools/android_imports.py --arch x86_64 --host-table {host_table_c} {imports_s} $in",
++        description="PS4 IMPORTS",
++    )
++    n.build(outputs=[imports_s, host_table_c], rule="ps4_imports",
++            inputs=[PORT_DIR / "host_imports.list", posix_imports, gl_imports],
++            implicit=[Path("tools/android_imports.py")])
++
++    generated_headers = [*xdk_headers(), alltypes, syscall_h, version_h, semantics_header, platform_semantics_header]
++
++    # ---------- guest compilation
++
++    n.rule(
++        name="ps4_guest_cc",
++        command=f"{compile_launcher(sln)}$ps4_guest_cc -MMD -MF $out.d $cflags -c $in -o $out",
++        description="PS4 CC $out",
++        depfile="$out.d",
++        deps="gcc",
++    )
++    n.rule(name="ps4_guest_as", command="$ps4_guest_cc --target=x86_64-linux-gnux32 -c $in -o $out",
++           description="PS4 AS $out")
++
++    # clang's own headers after musl's: the x86 intrinsics (opus includes
++    # xmmintrin.h where SSE is available)
++    resource_dir = subprocess.run([guest_cc, "-print-resource-dir"], capture_output=True, text=True).stdout.strip()
++    libc_includes = [
++        f"-isystem {libc_include}", f"-isystem {arch}", f"-isystem {MUSL_DIR}/arch/generic",
++        f"-isystem {MUSL_DIR}/include", *([f"-idirafter {resource_dir}/include"] if resource_dir else []),
++    ]
++    guest_abi = " ".join(GUEST_ABI_FLAGS + configuration_defines(sln))
++    guest_code = " ".join(GUEST_CODE_FLAGS)
++
++    def guest_object(source: Path, cflags: str, prefix: str = "") -> Path:
++        obj = obj_dir / prefix / Path(str(source).lstrip("/")).with_suffix(".o")
++        if str(source).startswith(str(BUILD)):
++            obj = obj_dir / prefix / source.relative_to(BUILD).with_suffix(".o")
++        n.build(outputs=obj, rule="ps4_guest_cc", inputs=source, implicit=generated_headers,
++                variables={"cflags": cflags})
++        return obj
++
++    # musl
++    musl_cflags = " ".join([
++        guest_abi, "-std=c99", "-ffreestanding", "-fno-common", "-D_XOPEN_SOURCE=700", "-w",
++        f"-I{arch}", f"-I{MUSL_DIR}/arch/generic", f"-I{libc_internal}",
++        f"-I{MUSL_DIR}/src/include", f"-I{MUSL_DIR}/src/internal", f"-I{libc_include}", f"-I{MUSL_DIR}/include",
++    ])
++    musl_objects = [guest_object(source, musl_cflags, "musl") for source in _musl_sources()]
++    libguestc = guest_dir / "libguestc.a"
++    n.rule(name="ps4_ar", command="rm -f $out && $ps4_guest_ar rcs $out @$out.rsp", description="PS4 AR $out",
++           rspfile="$out.rsp", rspfile_content="$in_newline")
++    n.build(outputs=libguestc, rule="ps4_ar", inputs=musl_objects)
++
++    # the game
++    objects: List[Path] = []
++    game_flags = [
++        "-std=gnu89", "-D__STRICT_ANSI__", "-w",
++        "-Wno-error=incompatible-pointer-types",
++        "-Wno-error=incompatible-function-pointer-types",
++        "-Wno-error=int-conversion",
++        "-Wno-error=implicit-function-declaration",
++        "-Wno-error=implicit-int",
++        "-Wno-error=return-type",
++    ]
++    game_cflags = " ".join([
++        guest_abi, guest_code, " ".join(game_flags),
++        f"-include {prefix_header}", f"-include {semantics_header}",
++        f"-I{LINUX_DIR}/include",
++        f"-iquote {Path(config['game_sources'])}",
++        game_defines_and_includes(config), *libc_includes, f"-idirafter {XDK_INCLUDE}",
++    ])
++    for source in game_sources(config):
++        cflags = game_cflags
++        if source.as_posix() == "source/main/main.c":
++            cflags += " " + updater_defines(getattr(sln, "port_release", False))
++        if source.as_posix() in VARIADIC_PROTOTYPE_FILES:
++            # (x86-64 passes floats and variadic arguments as AArch64 does not
++            # for 32-bit x86: the same prototypes the Android guest needs)
++            cflags += f" -include {ANDROID_DIR}/include/halo_android_variadic_prototypes.h"
++        objects.append(guest_object(source, cflags))
++    for source in sorted(Path(config["game_sources"]).glob("*.c")):
++        objects.append(guest_object(source, game_cflags))
++    objects.append(guest_object(STB_VORBIS_SOURCE, game_cflags))
++
++    # the platform layer shared with Linux, and the guest runtime
++    platform_cflags = " ".join([
++        guest_abi, guest_code, "-std=gnu11", "-D_GNU_SOURCE", "-DHALO_LINUX_PLATFORM_LAYER", "-w",
++        f"-include {prefix_header}", f"-include {platform_semantics_header}",
++        f"-I{LINUX_DIR}/src", f"-I{LINUX_DIR}/include", f"-I{runtime_dir}",
++        f"-I{ANDROID_DIR}/include", f"-I{TOML_DIR}", f"-I{EXPAT_DIR}", f"-I{KCP_DIR}", f"-I{MONOCYPHER_DIR}",
++        f"-I{ZLIB_DIR}", "-Isource -Isource/cseries",
++        f"-I{SDL_DIR}/include", f"-I{gl_include_root}", *libc_includes, f"-idirafter {XDK_INCLUDE}",
++    ])
++    guest_host_only = {"memory_watch.c"}  # replaced by guest_memory_watch.c
++    for source in sorted((LINUX_DIR / "src").glob("*.c")):
++        if source.name.startswith("posix_") or source.name in guest_host_only:
++            continue
++        objects.append(guest_object(source, platform_cflags))
++    for source in hud_assets_build(n, "ps4", gen_dir / "hud_hires_assets.c"):
++        objects.append(guest_object(source, platform_cflags))
++    objects.append(guest_object(TOML_DIR / "tomlc17.c", platform_cflags))
++    for name in EXPAT_SOURCES:
++        objects.append(guest_object(EXPAT_DIR / name, platform_cflags))
++    objects.append(guest_object(KCP_DIR / "ikcp.c", platform_cflags))
++    for source in opus_sources():
++        objects.append(guest_object(source, " ".join([opus_cflags(guest_abi), *libc_includes])))
++    for name in ("monocypher.c", "monocypher-ed25519.c"):
++        objects.append(guest_object(MONOCYPHER_DIR / name, platform_cflags))
++    for name in ZLIB_SOURCES:
++        objects.append(guest_object(ZLIB_DIR / name, " ".join([platform_cflags, *ZLIB_DEFINES])))
++    musl_math_cflags = " ".join([
++        guest_abi, "-std=gnu11", "-w", *libc_includes, f"-I{MUSL_MATH_DIR}/include",
++        f"-include {MUSL_MATH_DIR}/include/libm.h",
++    ])
++    for source in musl_math_sources():
++        objects.append(guest_object(source, musl_math_cflags))
++    runtime_internal_cflags = " ".join([
++        guest_abi, "-std=c99", "-ffreestanding", "-fno-common", "-D_XOPEN_SOURCE=700", "-D_GNU_SOURCE",
++        f"-I{runtime_dir}", f"-I{ANDROID_DIR}/include",
++        f"-I{arch}", f"-I{MUSL_DIR}/arch/generic", f"-I{libc_internal}",
++        f"-I{MUSL_DIR}/src/include", f"-I{MUSL_DIR}/src/internal", f"-I{libc_include}", f"-I{MUSL_DIR}/include",
++    ])
++    runtime_cflags = " ".join([
++        guest_abi, guest_code, "-std=gnu11", "-D_GNU_SOURCE",
++        f"-I{runtime_dir}", f"-I{ANDROID_DIR}/include", f"-I{LINUX_DIR}/src",
++        f"-I{SDL_DIR}/include", f"-I{gl_include_root}", *libc_includes,
++    ])
++    for source in sorted(runtime_dir.glob("*.c")):
++        if source.name in ("guest_thread.c", "guest_start.c"):
++            objects.append(guest_object(source, runtime_internal_cflags))
++        elif source.name == "guest_memory_watch.c":
++            objects.append(guest_object(source, platform_cflags))
++        else:
++            objects.append(guest_object(source, runtime_cflags))
++    # the SDL functions of the desktop paths the PS4 takes (port/ps4/guest)
++    for source in sorted((PORT_DIR / "guest").glob("*.c")):
++        objects.append(guest_object(source, runtime_cflags))
++    objects.append(guest_object(guest_gl_c, runtime_cflags))
++    objects.append(guest_object(guest_posix_c, runtime_cflags))
++    imports_o = obj_dir / "gen" / "imports.o"
++    n.build(outputs=imports_o, rule="ps4_guest_as", inputs=imports_s)
++    objects.append(imports_o)
++
++    # ---------- the guest image
++
++    linker_script = PORT_DIR / "guest" / "guest.ld"
++    n.rule(
++        name="ps4_guest_link",
++        command=(f"$ps4_guest_ld -m elf32_x86_64 -static -nostdlib -T {linker_script} "
++                 f"-Map $out.map -o $out @$out.rsp {libguestc}"),
++        description="PS4 LINK $out",
++        rspfile="$out.rsp",
++        rspfile_content="$in_newline",
++    )
++    n.build(outputs=image, rule="ps4_guest_link", inputs=objects, implicit=[libguestc, linker_script])
++
++    # the internet play's brokers, beside the image for the package
++    staged_brokers = BUILD / "brokers.txt"
++    n.rule(name="ps4_copy", command="cp $in $out", description="PS4 STAGE $out")
++    n.build(outputs=staged_brokers, rule="ps4_copy", inputs=Path("port/assets/network/brokers.txt"))
++    n.build(outputs="ps4", rule="phony",
++            inputs=[image, host_table_c, host_syscall_h, staged_brokers])
++    n.newline()

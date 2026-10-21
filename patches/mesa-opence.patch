@@ -1,0 +1,616 @@
+From 5d59d4c59cb7260ff29ce9b1e8cae5c406f7ce01 Mon Sep 17 00:00:00 2001
+From: ShiroKlein <ihaideezi@gmail.com>
+Date: Wed, 21 Oct 2026 08:41:54 +0300
+Subject: [PATCH] PS4: Zink for OpenGL - the app's Vulkan entry, a headless
+ kopper surface, the PS4 frontend (src/gallium/frontends/ps4), hud_cpu without
+ kern.cp_time
+
+---
+ meson.options                          |   7 +
+ src/gallium/auxiliary/hud/hud_cpu.c    |   4 +-
+ src/gallium/drivers/zink/zink_kopper.c |  20 +-
+ src/gallium/drivers/zink/zink_kopper.h |   5 +-
+ src/gallium/drivers/zink/zink_screen.c |  12 +
+ src/gallium/frontends/ps4/meson.build  |  16 ++
+ src/gallium/frontends/ps4/ps4_gl.c     | 314 +++++++++++++++++++++++++
+ src/gallium/frontends/ps4/ps4_gl.h     |  66 ++++++
+ src/gallium/meson.build                |   3 +
+ 9 files changed, 443 insertions(+), 4 deletions(-)
+ create mode 100644 src/gallium/frontends/ps4/meson.build
+ create mode 100644 src/gallium/frontends/ps4/ps4_gl.c
+ create mode 100644 src/gallium/frontends/ps4/ps4_gl.h
+
+diff --git a/meson.options b/meson.options
+index 9a132f8..c65e363 100644
+--- a/meson.options
++++ b/meson.options
+@@ -865,3 +865,10 @@ option(
+   type : 'feature',
+   description : 'Use SPIRV-Tools for dumping SPIR-V for debugging purposes (required by CLC)'
+ )
++
++option(
++  'ps4-gl',
++  type : 'boolean',
++  value : false,
++  description : 'PS4: the OpenGL frontend for Zink (src/gallium/frontends/ps4)'
++)
+diff --git a/src/gallium/auxiliary/hud/hud_cpu.c b/src/gallium/auxiliary/hud/hud_cpu.c
+index ce66a03..742d327 100644
+--- a/src/gallium/auxiliary/hud/hud_cpu.c
++++ b/src/gallium/auxiliary/hud/hud_cpu.c
+@@ -38,7 +38,7 @@
+ #if DETECT_OS_WINDOWS
+ #include <windows.h>
+ #endif
+-#if DETECT_OS_BSD
++#if DETECT_OS_BSD && !defined(__PS4__) /* PS4: no kern.cp_time */
+ #include <sys/types.h>
+ #include <sys/sysctl.h>
+ #if DETECT_OS_NETBSD || DETECT_OS_OPENBSD
+@@ -95,7 +95,7 @@ get_cpu_stats(unsigned cpu_index, uint64_t *busy_time, uint64_t *total_time)
+    return true;
+ }
+ 
+-#elif DETECT_OS_BSD
++#elif DETECT_OS_BSD && !defined(__PS4__)
+ 
+ static bool
+ get_cpu_stats(unsigned cpu_index, uint64_t *busy_time, uint64_t *total_time)
+diff --git a/src/gallium/drivers/zink/zink_kopper.c b/src/gallium/drivers/zink/zink_kopper.c
+index 4ab5839..8631cbc 100644
+--- a/src/gallium/drivers/zink/zink_kopper.c
++++ b/src/gallium/drivers/zink/zink_kopper.c
+@@ -80,6 +80,9 @@ init_dt_type(struct kopper_displaytarget *cdt)
+       cdt->type = KOPPER_WIN32;
+       break;
+ #endif
++   case VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT:
++      cdt->type = KOPPER_HEADLESS;
++      break;
+    default:
+       UNREACHABLE("unsupported!");
+    }
+@@ -119,6 +122,13 @@ kopper_CreateSurface(struct zink_screen *screen, struct kopper_displaytarget *cd
+       break;
+    }
+ #endif
++   case VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT: {
++      VkHeadlessSurfaceCreateInfoEXT headless = {
++         VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT, NULL, 0
++      };
++      error = VKSCR(CreateHeadlessSurfaceEXT)(screen->instance, &headless, NULL, &surface);
++      break;
++   }
+    default:
+       UNREACHABLE("unsupported!");
+    }
+@@ -235,6 +245,9 @@ find_dt_entry(struct zink_screen *screen, const struct kopper_displaytarget *cdt
+       break;
+    }
+ #endif
++   case KOPPER_HEADLESS:
++      he = _mesa_hash_table_search(&screen->dts, (void *)cdt->info.bos.padding[2]);
++      break;
+    default:
+       UNREACHABLE("unsupported!");
+    }
+@@ -313,6 +326,7 @@ kopper_CreateSwapchain(struct zink_screen *screen, struct kopper_displaytarget *
+    switch (cdt->type) {
+    case KOPPER_X11:
+    case KOPPER_WIN32:
++   case KOPPER_HEADLESS:
+       /* With Xcb, minImageExtent, maxImageExtent, and currentExtent must always equal the window size.
+        * ...
+        * Due to above restrictions, it is only possible to create a new swapchain on this
+@@ -444,6 +458,7 @@ zink_kopper_displaytarget_create(struct zink_screen *screen, unsigned tex_usage,
+             break;
+          case KOPPER_WAYLAND:
+          case KOPPER_WIN32:
++         case KOPPER_HEADLESS:
+             _mesa_hash_table_init(&screen->dts, screen, _mesa_hash_pointer, _mesa_key_pointer_equal);
+             break;
+          default:
+@@ -516,6 +531,9 @@ zink_kopper_displaytarget_create(struct zink_screen *screen, unsigned tex_usage,
+       break;
+    }
+ #endif
++   case KOPPER_HEADLESS:
++      _mesa_hash_table_insert(&screen->dts, (void *)cdt->info.bos.padding[2], cdt);
++      break;
+    default:
+       UNREACHABLE("unsupported!");
+    }
+@@ -755,7 +773,7 @@ kopper_present(void *data, void *gdata, int thread_idx)
+    cpi->info.pResults = &error;
+ 
+    simple_mtx_lock(screen->queue_lock);
+-   if (screen->driver_workarounds.implicit_sync && cdt->type != KOPPER_WIN32) {
++   if (screen->driver_workarounds.implicit_sync && cdt->type != KOPPER_WIN32 && cdt->type != KOPPER_HEADLESS) {
+       if (!screen->fence) {
+          VkFenceCreateInfo fci = {0};
+          fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+diff --git a/src/gallium/drivers/zink/zink_kopper.h b/src/gallium/drivers/zink/zink_kopper.h
+index fba05a0..0a9951a 100644
+--- a/src/gallium/drivers/zink/zink_kopper.h
++++ b/src/gallium/drivers/zink/zink_kopper.h
+@@ -74,7 +74,10 @@ struct kopper_swapchain {
+ enum kopper_type {
+    KOPPER_X11,
+    KOPPER_WAYLAND,
+-   KOPPER_WIN32
++   KOPPER_WIN32,
++   /* VK_EXT_headless_surface (the PS4's VideoOut): a fixed-size screen, keyed
++    * by the frontend's drawable in kopper_loader_info::bos.padding[2] */
++   KOPPER_HEADLESS
+ };
+ 
+ struct kopper_displaytarget
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index 732bdcd..e5774a0 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -79,6 +79,10 @@ bool zink_tracing = false;
+ #endif
+ #endif
+ 
++#ifdef __PS4__
++void *zink_ps4_vk_get_instance_proc_addr(void); /* the app's (frontends/ps4/ps4_gl.h) */
++#endif
++
+ #ifdef __APPLE__
+ #include "MoltenVK/mvk_vulkan.h"
+ // Source of MVK_VERSION
+@@ -3365,6 +3369,13 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+ 
+    u_trace_state_init();
+ 
++#ifdef __PS4__
++   /* PS4: RADV is linked into the app, which adds its window system to it and
++    * hands over the entry point (frontends/ps4/ps4_gl.h) */
++   screen->vk_GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)zink_ps4_vk_get_instance_proc_addr();
++   screen->vk_GetDeviceProcAddr = screen->vk_GetInstanceProcAddr ?
++      (PFN_vkGetDeviceProcAddr)screen->vk_GetInstanceProcAddr(VK_NULL_HANDLE, "vkGetDeviceProcAddr") : NULL;
++#else
+    screen->loader_lib = util_dl_open(VK_LIBNAME);
+    if (!screen->loader_lib) {
+       if (!screen->driver_name_is_inferred)
+@@ -3374,6 +3385,7 @@ zink_internal_create_screen(const struct pipe_screen_config *config, int64_t dev
+ 
+    screen->vk_GetInstanceProcAddr = (PFN_vkGetInstanceProcAddr)util_dl_get_proc_address(screen->loader_lib, "vkGetInstanceProcAddr");
+    screen->vk_GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)util_dl_get_proc_address(screen->loader_lib, "vkGetDeviceProcAddr");
++#endif
+    if (!screen->vk_GetInstanceProcAddr ||
+        !screen->vk_GetDeviceProcAddr) {
+       if (!screen->driver_name_is_inferred)
+diff --git a/src/gallium/frontends/ps4/meson.build b/src/gallium/frontends/ps4/meson.build
+new file mode 100644
+index 0000000..ed9a376
+--- /dev/null
++++ b/src/gallium/frontends/ps4/meson.build
+@@ -0,0 +1,16 @@
++# Copyright 2026 OpenCE PS4 contributors
++# SPDX-License-Identifier: MIT
++
++# PS4: OpenGL (ES) contexts on Zink with a kopper swapchain on a headless
++# surface (ps4_gl.h). A static library the app links with Zink, the GL core
++# and RADV.
++libps4gl = static_library(
++  'ps4gl',
++  files('ps4_gl.c', 'ps4_gl.h'),
++  include_directories : [
++    inc_include, inc_util, inc_mesa, inc_src, inc_gallium,
++    inc_gallium_aux, inc_gallium_drivers, inc_glapi,
++  ],
++  dependencies : [idep_mesautil, dep_thread, idep_nir_headers],
++  build_by_default : true,
++)
+diff --git a/src/gallium/frontends/ps4/ps4_gl.c b/src/gallium/frontends/ps4/ps4_gl.c
+new file mode 100644
+index 0000000..8a13e23
+--- /dev/null
++++ b/src/gallium/frontends/ps4/ps4_gl.c
+@@ -0,0 +1,314 @@
++/*
++ * Copyright 2026 OpenCE PS4 contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * The PS4 frontend (ps4_gl.h): the parts of the DRI frontend's kopper path
++ * (frontends/dri/kopper.c, dri_drawable.c, dri_context.c) that a single
++ * window on a headless surface needs, without the DRI loader interface.
++ */
++
++#include "ps4_gl.h"
++
++#include <stdarg.h>
++#include <stdio.h>
++#include <string.h>
++
++#include <vulkan/vulkan_core.h>
++
++#include "frontend/api.h"
++#include "kopper_interface.h"
++#include "main/glthread.h"
++#include "main/mtypes.h"
++#include "pipe/p_context.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_state.h"
++#include "state_tracker/st_context.h"
++#include "util/os_time.h"
++#include "util/u_atomic.h"
++#include "util/u_inlines.h"
++#include "util/u_memory.h"
++#include "zink/zink_kopper.h"
++#include "zink/zink_public.h"
++#include "glapi.h"
++
++struct ps4gl_window {
++   struct pipe_frontend_drawable base;
++   struct st_visual visual;
++   struct kopper_loader_info info;
++   struct pipe_resource *textures[ST_ATTACHMENT_COUNT];
++   unsigned width, height;
++   struct pipe_fence_handle *throttle_fence;
++   bool flushing;
++};
++
++struct ps4gl_context {
++   struct st_context *st;
++   struct ps4gl_window *window;
++};
++
++static struct pipe_frontend_screen screen;
++static struct st_config_options options;
++static char error_text[256];
++static uint32_t next_drawable_id;
++
++static void
++set_error(const char *format, ...)
++{
++   va_list arguments;
++
++   va_start(arguments, format);
++   vsnprintf(error_text, sizeof(error_text), format, arguments);
++   va_end(arguments);
++}
++
++const char *
++ps4gl_error(void)
++{
++   return error_text;
++}
++
++static int
++screen_get_param(struct pipe_frontend_screen *fscreen, enum st_manager_param param)
++{
++   (void)fscreen;
++   (void)param;
++   return 0;
++}
++
++bool
++ps4gl_initialize(void)
++{
++   struct pipe_screen *pscreen;
++
++   if (screen.screen)
++      return true;
++   pscreen = zink_create_screen(NULL, NULL);
++   if (!pscreen) {
++      set_error("Zink could not create its screen (no Vulkan device, or one Zink cannot use)");
++      return false;
++   }
++   screen.screen = pscreen;
++   screen.get_param = screen_get_param;
++   return true;
++}
++
++/* ---------- the window */
++
++static bool
++window_validate(struct st_context *st, struct pipe_frontend_drawable *drawable,
++                const enum st_attachment_type *statts, unsigned count,
++                struct pipe_resource **out, struct pipe_resource **resolve)
++{
++   struct ps4gl_window *window = (struct ps4gl_window *)drawable;
++   struct pipe_screen *pscreen = screen.screen;
++   unsigned index;
++
++   (void)st;
++   if (resolve)
++      *resolve = NULL;
++   for (index = 0; index < count; index++) {
++      enum st_attachment_type statt = statts[index];
++      struct pipe_resource templ;
++
++      if (!window->textures[statt]) {
++         memset(&templ, 0, sizeof(templ));
++         templ.target = PIPE_TEXTURE_2D;
++         templ.width0 = window->width;
++         templ.height0 = window->height;
++         templ.depth0 = 1;
++         templ.array_size = 1;
++         if (statt == ST_ATTACHMENT_DEPTH_STENCIL) {
++            templ.format = window->visual.depth_stencil_format;
++            templ.bind = PIPE_BIND_DEPTH_STENCIL;
++            if (templ.format != PIPE_FORMAT_NONE)
++               window->textures[statt] = pscreen->resource_create(pscreen, &templ);
++         } else if (statt == ST_ATTACHMENT_BACK_LEFT) {
++            /* the swapchain's images, behind one resource (kopper) */
++            templ.format = window->visual.color_format;
++            templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DISPLAY_TARGET;
++            window->textures[statt] = pscreen->resource_create_drawable(pscreen, &templ, &window->info);
++         } else {
++            templ.format = window->visual.color_format;
++            templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
++            window->textures[statt] = pscreen->resource_create(pscreen, &templ);
++         }
++      }
++      out[index] = NULL;
++      pipe_resource_reference(&out[index], window->textures[statt]);
++   }
++   return true;
++}
++
++static bool
++window_flush_front(struct st_context *st, struct pipe_frontend_drawable *drawable,
++                   enum st_attachment_type statt)
++{
++   (void)st;
++   (void)drawable;
++   (void)statt;
++   /* only the back buffer is ever shown */
++   return true;
++}
++
++static bool
++window_flush_swapbuffers(struct st_context *st, struct pipe_frontend_drawable *drawable)
++{
++   (void)st;
++   (void)drawable;
++   return true;
++}
++
++struct ps4gl_window *
++ps4gl_create_window(unsigned width, unsigned height, int depth_bits, int stencil_bits)
++{
++   struct ps4gl_window *window = CALLOC_STRUCT(ps4gl_window);
++   VkHeadlessSurfaceCreateInfoEXT *headless;
++
++   if (!window) {
++      set_error("out of memory");
++      return NULL;
++   }
++   window->width = width;
++   window->height = height;
++   window->visual.buffer_mask = ST_ATTACHMENT_BACK_LEFT_MASK;
++   window->visual.color_format = PIPE_FORMAT_R8G8B8A8_UNORM;
++   window->visual.depth_stencil_format = PIPE_FORMAT_NONE;
++   if (depth_bits > 0 || stencil_bits > 0) {
++      window->visual.buffer_mask |= ST_ATTACHMENT_DEPTH_STENCIL_MASK;
++      window->visual.depth_stencil_format = stencil_bits > 0 ? PIPE_FORMAT_Z24_UNORM_S8_UINT :
++         depth_bits > 24 ? PIPE_FORMAT_Z32_FLOAT : PIPE_FORMAT_Z24X8_UNORM;
++      if (!screen.screen->is_format_supported(screen.screen, window->visual.depth_stencil_format,
++                                              PIPE_TEXTURE_2D, 0, 0, PIPE_BIND_DEPTH_STENCIL))
++         window->visual.depth_stencil_format = stencil_bits > 0 ? PIPE_FORMAT_Z32_FLOAT_S8X24_UINT :
++            PIPE_FORMAT_Z32_FLOAT;
++   }
++   window->visual.accum_format = PIPE_FORMAT_NONE;
++
++   /* the surface: VK_EXT_headless_surface; the drawable is the key Zink
++    * finds its swapchain by (zink_kopper.c) */
++   headless = (VkHeadlessSurfaceCreateInfoEXT *)&window->info.bos;
++   headless->sType = VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT;
++   headless->pNext = NULL;
++   headless->flags = 0;
++   window->info.bos.padding[2] = (intptr_t)window;
++   window->info.has_alpha = 0;
++   window->info.initial_swap_interval = 1;
++   window->info.present_opaque = true;
++
++   window->base.visual = &window->visual;
++   window->base.fscreen = &screen;
++   window->base.ID = p_atomic_inc_return(&next_drawable_id);
++   window->base.stamp = 1;
++   window->base.validate = window_validate;
++   window->base.flush_front = window_flush_front;
++   window->base.flush_swapbuffers = window_flush_swapbuffers;
++   return window;
++}
++
++/* ---------- contexts */
++
++struct ps4gl_context *
++ps4gl_create_context(struct ps4gl_window *window, bool es, int major, int minor, bool debug)
++{
++   struct ps4gl_context *context;
++   struct st_context_attribs attribs;
++   enum st_context_error error = ST_CONTEXT_SUCCESS;
++
++   if (!screen.screen || !window) {
++      set_error("no screen or window");
++      return NULL;
++   }
++   context = CALLOC_STRUCT(ps4gl_context);
++   if (!context) {
++      set_error("out of memory");
++      return NULL;
++   }
++   memset(&attribs, 0, sizeof(attribs));
++   attribs.profile = es ? API_OPENGLES2 : API_OPENGL_CORE;
++   attribs.major = major;
++   attribs.minor = minor;
++   if (debug)
++      attribs.flags |= ST_CONTEXT_FLAG_DEBUG;
++   attribs.visual = window->visual;
++   attribs.options = options;
++   context->st = st_api_create_context(&screen, &attribs, &error, NULL);
++   if (!context->st) {
++      set_error("st_api_create_context failed (%d) for %s %d.%d", (int)error, es ? "OpenGL ES" : "OpenGL",
++                major, minor);
++      FREE(context);
++      return NULL;
++   }
++   context->window = window;
++   return context;
++}
++
++bool
++ps4gl_make_current(struct ps4gl_context *context)
++{
++   if (!context)
++      return st_api_make_current(NULL, NULL, NULL);
++   return st_api_make_current(context->st, &context->window->base, &context->window->base);
++}
++
++/* after the frame's last commands, before the flush: the back buffer made
++ * ready to present (dri_drawable.c's notify_before_flush_cb) */
++static void
++before_flush(void *data)
++{
++   struct ps4gl_context *context = data;
++   struct pipe_context *pipe = context->st->pipe;
++
++   pipe->flush_resource(pipe, context->window->textures[ST_ATTACHMENT_BACK_LEFT]);
++}
++
++void
++ps4gl_swap_buffers(struct ps4gl_context *context)
++{
++   struct ps4gl_window *window;
++   struct pipe_screen *pscreen = screen.screen;
++   struct pipe_resource *back;
++   struct pipe_fence_handle *fence = NULL;
++
++   if (!context)
++      return;
++   window = context->window;
++   back = window->textures[ST_ATTACHMENT_BACK_LEFT];
++   if (!back)
++      return;
++   _mesa_glthread_finish(context->st->ctx);
++   if (window->flushing)
++      return;
++   window->flushing = true;
++   st_context_flush(context->st, ST_FLUSH_END_OF_FRAME, &fence, before_flush, context);
++   window->flushing = false;
++   /* one frame in flight: wait for the previous one (dri_flush's throttle) */
++   if (window->throttle_fence) {
++      pscreen->fence_finish(pscreen, NULL, window->throttle_fence, OS_TIMEOUT_INFINITE);
++      pscreen->fence_reference(pscreen, &window->throttle_fence, NULL);
++   }
++   window->throttle_fence = fence;
++   pscreen->flush_frontbuffer(pscreen, context->st->pipe, back, 0, 0, window, 0, NULL);
++   /* the next frame validates the framebuffer again (the next image) */
++   p_atomic_inc(&window->base.stamp);
++}
++
++void
++ps4gl_set_swap_interval(struct ps4gl_context *context, int interval)
++{
++   struct ps4gl_window *window;
++
++   if (!context)
++      return;
++   window = context->window;
++   window->info.initial_swap_interval = interval;
++   if (window->textures[ST_ATTACHMENT_BACK_LEFT])
++      zink_kopper_set_swap_interval(screen.screen, window->textures[ST_ATTACHMENT_BACK_LEFT], interval);
++}
++
++void *
++ps4gl_get_proc_address(const char *name)
++{
++   return (void *)_mesa_glapi_get_proc_address(name);
++}
+diff --git a/src/gallium/frontends/ps4/ps4_gl.h b/src/gallium/frontends/ps4/ps4_gl.h
+new file mode 100644
+index 0000000..f450eea
+--- /dev/null
++++ b/src/gallium/frontends/ps4/ps4_gl.h
+@@ -0,0 +1,66 @@
++/*
++ * Copyright 2026 OpenCE PS4 contributors
++ * SPDX-License-Identifier: MIT
++ */
++
++/*
++ * PS4: OpenGL (ES) contexts on Zink, the only GL the PS4 can have (its own,
++ * Piglet, cannot compile shaders on retail consoles). Zink draws through RADV,
++ * which the app links statically, and presents through a kopper swapchain on a
++ * Vulkan headless surface that the app's window system puts on VideoOut
++ * (zink_kopper.c, KOPPER_HEADLESS). The app hands Zink its Vulkan entry point
++ * by defining zink_ps4_vk_get_instance_proc_addr().
++ *
++ * One window (the screen) and the contexts made for it; every call but
++ * ps4gl_swap_buffers is made rarely, from any thread.
++ */
++
++#ifndef PS4_GL_H
++#define PS4_GL_H
++
++#include <stdbool.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct ps4gl_window;
++struct ps4gl_context;
++
++/* the app's vkGetInstanceProcAddr (a PFN_vkGetInstanceProcAddr), with its
++ * VK_EXT_headless_surface and VK_KHR_swapchain */
++void *zink_ps4_vk_get_instance_proc_addr(void);
++
++/* creates Zink's screen (the Vulkan instance and device); false if Zink cannot
++ * run, with the reason in ps4gl_error() */
++bool ps4gl_initialize(void);
++
++/* the window of width x height pixels (the swapchain's size): RGBA8 colour,
++ * with a depth/stencil buffer when depth_bits or stencil_bits */
++struct ps4gl_window *ps4gl_create_window(unsigned width, unsigned height, int depth_bits, int stencil_bits);
++
++/* an OpenGL ES context (es is true; the newest version Zink offers, at least
++ * major.minor) or a core profile one, drawing to window */
++struct ps4gl_context *ps4gl_create_context(struct ps4gl_window *window, bool es, int major, int minor, bool debug);
++
++/* binds context and its window to the calling thread (NULL unbinds) */
++bool ps4gl_make_current(struct ps4gl_context *context);
++
++/* presents the back buffer: flushes the context bound to this thread, waits
++ * for the previous frame's GPU work (one frame in flight) and queues the
++ * present */
++void ps4gl_swap_buffers(struct ps4gl_context *context);
++
++/* 0: present at once (tearing), 1 and more: at the vertical blank */
++void ps4gl_set_swap_interval(struct ps4gl_context *context, int interval);
++
++/* the GL entry point of that name, or NULL */
++void *ps4gl_get_proc_address(const char *name);
++
++const char *ps4gl_error(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/gallium/meson.build b/src/gallium/meson.build
+index 9b02fd1..eb36e7f 100644
+--- a/src/gallium/meson.build
++++ b/src/gallium/meson.build
+@@ -198,6 +198,9 @@ else
+ endif
+ if with_gallium_zink
+   subdir('drivers/zink')
++  if get_option('ps4-gl')
++    subdir('frontends/ps4')
++  endif
+ else
+   driver_zink = declare_dependency()
+ endif
+-- 
+2.53.0
+
