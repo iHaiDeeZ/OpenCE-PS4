@@ -2470,10 +2470,10 @@ index 00000000..2afb1a74
 +}
 diff --git a/port/ps4/host/host_main.c b/port/ps4/host/host_main.c
 new file mode 100644
-index 00000000..b6564084
+index 00000000..c78def73
 --- /dev/null
 +++ b/port/ps4/host/host_main.c
-@@ -0,0 +1,327 @@
+@@ -0,0 +1,339 @@
 +/*
 +HOST_MAIN.C
 +
@@ -2785,8 +2785,20 @@ index 00000000..b6564084
 +
 +int main(int argc, char *argv[])
 +{
++	int fd;
++
 +	(void)argc;
 +	(void)argv;
++	/* The guest's standard output and error are the host's log
++	(host_syscall.c sends its descriptors 1 and 2 there): a file opened for
++	it must never be given those numbers, which a PS4 process need not have
++	open. */
++	mkdir(HOST_DATA_ROOT, 0777);
++	for (fd = 0; fd <= 2; fd++)
++	{
++		if (fcntl(fd, F_GETFD) == -1)
++			open(HOST_DATA_ROOT "/stdio.log", O_WRONLY | O_CREAT | O_APPEND, 0666);
++	}
 +	host_logf(HOST_LOG_INFO, "OpenCE for PS4 starting");
 +	ps4_boot_trace("OpenCE " OPENCE_PS4_VERSION " starting");
 +	if (host_memory_initialize() != 0)
@@ -5345,10 +5357,10 @@ index 00000000..c70fb443
 +}
 diff --git a/port/ps4/host/host_thread.c b/port/ps4/host/host_thread.c
 new file mode 100644
-index 00000000..9845d0e4
+index 00000000..8f8a02d9
 --- /dev/null
 +++ b/port/ps4/host/host_thread.c
-@@ -0,0 +1,217 @@
+@@ -0,0 +1,223 @@
 +/*
 +HOST_THREAD.C
 +
@@ -5376,6 +5388,7 @@ index 00000000..9845d0e4
 +void *ps4_pthread_self(void) __asm__("scePthreadSelf");
 +
 +#define GUARD_SIZE 0x4000
++#define MINIMUM_STACK_SIZE (4 * 1024 * 1024)
 +
 +static __thread uint32_t guest_tp;
 +static __thread int thread_id;
@@ -5533,6 +5546,11 @@ index 00000000..9845d0e4
 +	}
 +	pthread_mutex_unlock(&reaper_lock);
 +
++	/* the PS4 runtime's pthread_create raises any smaller stack size to
++	4 MB (port/ps4_runtime.cpp), which on a stack of ours would run the
++	thread past its end */
++	if (stack_size < MINIMUM_STACK_SIZE)
++		stack_size = MINIMUM_STACK_SIZE;
 +	stack_size = (stack_size + 0xffff) & ~(size_t)0xffff;
 +	stack = stack_allocate(stack_size, &start->mapping, &start->mapping_size);
 +	if (!stack)

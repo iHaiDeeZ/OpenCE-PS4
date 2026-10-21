@@ -4,8 +4,7 @@
 decompilation, for jailbroken PS4 consoles (GoldHEN), built the way the SMW port is: the PS4 runtime, toolchain and
 Mesa RADV of SMW/SSBU, a package with its own home screen art, logs and crash reports in `/data/OpenCE`.
 
-**Status: v00.01, the first build, untested on a console.** Everything compiles, links and packages; nothing has run
-on a PS4 yet.
+**Status: v00.02, untested on a console.** Everything compiles, links and packages; nothing has run on a PS4 yet.
 
 ## How it works
 
@@ -36,9 +35,10 @@ Android port already does this with AArch64 code in a 64-bit app; this port does
 
 Title ID `OPCE00001`. Install `out/OpenCE-vXX.YY.pkg` with GoldHEN's Package Installer.
 
-**The game data:** put your own Xbox disc image of Halo: Combat Evolved (`.iso` or `.xiso`, any version) in
-`/data/OpenCE` over FTP. At the first start the game extracts its `maps` folder from it (about 1.8 GB); the image can
-be deleted afterwards. Nothing of the game's data is in the package.
+**The game data:** the `maps` folder of your own Xbox copy of Halo: Combat Evolved goes in `/data/OpenCE/maps` over
+FTP (the 24 `.map` files, about 1.8 GB; an extracted game folder has it as it is). Or put your Xbox disc image
+(`.iso` or `.xiso`, any version) in `/data/OpenCE`: at the first start the game extracts the `maps` folder from it,
+and the image can be deleted afterwards. Nothing of the game's data is in the package.
 
 ## Controls
 
