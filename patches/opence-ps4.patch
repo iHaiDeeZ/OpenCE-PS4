@@ -1975,10 +1975,10 @@ index 00000000..c32df750
 +#define IPC_64 0
 diff --git a/port/ps4/host/host.h b/port/ps4/host/host.h
 new file mode 100644
-index 00000000..8da3d8bb
+index 00000000..4390e6d0
 --- /dev/null
 +++ b/port/ps4/host/host.h
-@@ -0,0 +1,136 @@
+@@ -0,0 +1,143 @@
 +/*
 +HOST.H
 +
@@ -2066,6 +2066,9 @@ index 00000000..8da3d8bb
 +/* direct memory still free, in bytes */
 +uint64_t host_direct_memory_free(void);
 +
++/* waits for the large writes still being made (host_syscall.c) */
++void host_syscall_flush(void);
++
 +/* ---------- the guest image (host_loader.c) */
 +
 +struct host_guest_image
@@ -2108,6 +2111,10 @@ index 00000000..8da3d8bb
 +#define HOST_SCREEN_HEIGHT 1080
 +/* reads the pads once a frame (host_sdl.c), from the frame's swap */
 +void host_sdl_frame(void);
++/* the shaders compiled and programs linked since the last call (host_gl.c) */
++void host_gl_frame_counts(unsigned *compiled, unsigned *linked);
++/* whether GL calls run on Mesa's glthread (host_gl.c) */
++int host_gl_threaded(void);
 +
 +/* ---------- debugging (host_debug.c) */
 +
@@ -2192,10 +2199,10 @@ index 00000000..8fe95841
 +}
 diff --git a/port/ps4/host/host_gl.c b/port/ps4/host/host_gl.c
 new file mode 100644
-index 00000000..31d9dd4d
+index 00000000..66d5af33
 --- /dev/null
 +++ b/port/ps4/host/host_gl.c
-@@ -0,0 +1,115 @@
+@@ -0,0 +1,166 @@
 +/*
 +HOST_GL.C
 +
@@ -2210,15 +2217,56 @@ index 00000000..31d9dd4d
 +#include "host.h"
 +
 +#include <GLES3/gl32.h>
++#include <stdlib.h>
 +#include <string.h>
 +
 +#include "ps4_gl.h"
++
++/* shader compiles and program links, counted for the hitch log (host_sdl.c) */
++static void (*real_compile_shader)(GLuint);
++static void (*real_link_program)(GLuint);
++static volatile unsigned shaders_compiled, programs_linked;
++
++static void counted_compile_shader(GLuint shader)
++{
++	__sync_fetch_and_add(&shaders_compiled, 1);
++	real_compile_shader(shader);
++}
++
++static void counted_link_program(GLuint program)
++{
++	__sync_fetch_and_add(&programs_linked, 1);
++	real_link_program(program);
++}
++
++void host_gl_frame_counts(unsigned *compiled, unsigned *linked)
++{
++	*compiled = __sync_lock_test_and_set(&shaders_compiled, 0);
++	*linked = __sync_lock_test_and_set(&programs_linked, 0);
++}
++
++int host_gl_threaded(void)
++{
++	const char *setting = getenv("mesa_glthread");
++
++	return !setting || (strcmp(setting, "false") && strcmp(setting, "0"));
++}
 +
 +void *host_gl_resolve(const char *name)
 +{
 +	/* the base-vertex extensions' entry points are the core function's */
 +	if (!strcmp(name, "glDrawElementsBaseVertexEXT") || !strcmp(name, "glDrawElementsBaseVertexOES"))
 +		name = "glDrawElementsBaseVertex";
++	if (!strcmp(name, "glCompileShader"))
++	{
++		real_compile_shader = ps4gl_get_proc_address(name);
++		return real_compile_shader ? (void *)counted_compile_shader : NULL;
++	}
++	if (!strcmp(name, "glLinkProgram"))
++	{
++		real_link_program = ps4gl_get_proc_address(name);
++		return real_link_program ? (void *)counted_link_program : NULL;
++	}
 +	return ps4gl_get_proc_address(name);
 +}
 +
@@ -2301,7 +2349,17 @@ index 00000000..31d9dd4d
 +GL_MAP_INVALIDATE_RANGE_BIT, whose cost per call was ruinous on Adreno) */
 +void host_gl_buffer_write(uint32_t target, uint32_t offset, uint32_t size, const void *data)
 +{
-+	void *mapping = glMapBufferRange(target, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
++	void *mapping;
++
++	/* under glthread a mapping waits for its thread to catch up, where
++	glBufferSubData is queued with a copy of the data (the driver then writes
++	the range behind the GPU's work, as its threaded context does) */
++	if (host_gl_threaded())
++	{
++		glBufferSubData(target, offset, size, data);
++		return;
++	}
++	mapping = glMapBufferRange(target, offset, size, GL_MAP_WRITE_BIT | GL_MAP_UNSYNCHRONIZED_BIT);
 +
 +	if (!mapping)
 +	{
@@ -2470,10 +2528,10 @@ index 00000000..2afb1a74
 +}
 diff --git a/port/ps4/host/host_main.c b/port/ps4/host/host_main.c
 new file mode 100644
-index 00000000..c78def73
+index 00000000..e76047a8
 --- /dev/null
 +++ b/port/ps4/host/host_main.c
-@@ -0,0 +1,339 @@
+@@ -0,0 +1,367 @@
 +/*
 +HOST_MAIN.C
 +
@@ -2573,6 +2631,7 @@ index 00000000..c78def73
 +
 +void host_exit(int code)
 +{
++	host_syscall_flush();
 +	host_logf(HOST_LOG_INFO, "the game exited (%d)", code);
 +	ps4_boot_trace("the game exited");
 +	_exit(code);
@@ -2636,6 +2695,32 @@ index 00000000..c78def73
 +		*equals = 0;
 +		environment_set(environment, line, equals + 1);
 +		host_logf(HOST_LOG_INFO, "environment.txt: %s=%s", line, equals + 1);
++	}
++	fclose(file);
++}
++
++/* env.txt in the data folder: NAME=value lines for the host itself, before
++anything reads them: Mesa's switches (GALLIUM_THREAD=0, mesa_glthread=false,
++ZINK_DEBUG=...), for tests without a new package */
++static void host_environment_file(void)
++{
++	FILE *file = fopen(HOST_DATA_ROOT "/env.txt", "r");
++	char line[512];
++
++	if (!file)
++		return;
++	while (fgets(line, sizeof(line), file))
++	{
++		char *equals = strchr(line, '=');
++		size_t length = strlen(line);
++
++		while (length && (line[length - 1] == '\n' || line[length - 1] == '\r'))
++			line[--length] = 0;
++		if (!equals || line[0] == '#')
++			continue;
++		*equals = 0;
++		setenv(line, equals + 1, 1);
++		host_logf(HOST_LOG_INFO, "env.txt: %s=%s", line, equals + 1);
 +	}
 +	fclose(file);
 +}
@@ -2765,8 +2850,8 @@ index 00000000..c78def73
 +	environment_set(&environment, "TZ", zone);
 +	environment_file(&environment);
 +	copy_file(HOST_PACKAGE_ROOT "/brokers.txt", HOST_DATA_ROOT "/brokers.txt");
-+	if (stat(HOST_DATA_ROOT "/maps/ui.map", &information) != 0)
-+		host_logf(HOST_LOG_INFO, "no maps in %s yet: a disc image (.iso) there is extracted", HOST_DATA_ROOT);
++	if (stat(HOST_PACKAGE_ROOT "/maps/ui.map", &information) != 0 && stat(HOST_DATA_ROOT "/maps/ui.map", &information) != 0)
++		host_logf(HOST_LOG_INFO, "no maps in the package or %s yet: a disc image (.iso) there is extracted", HOST_DATA_ROOT);
 +
 +	ps4_boot_trace("loading the game image");
 +	image = read_file(HOST_PACKAGE_ROOT "/halo_guest.elf", &image_size);
@@ -2801,6 +2886,7 @@ index 00000000..c78def73
 +	}
 +	host_logf(HOST_LOG_INFO, "OpenCE for PS4 starting");
 +	ps4_boot_trace("OpenCE " OPENCE_PS4_VERSION " starting");
++	host_environment_file();
 +	if (host_memory_initialize() != 0)
 +	{
 +		host_memory_report_low_mappings();
@@ -3650,10 +3736,10 @@ index 00000000..fb07351d
 +#endif
 diff --git a/port/ps4/host/host_sdl.c b/port/ps4/host/host_sdl.c
 new file mode 100644
-index 00000000..38144076
+index 00000000..f996f9b8
 --- /dev/null
 +++ b/port/ps4/host/host_sdl.c
-@@ -0,0 +1,709 @@
+@@ -0,0 +1,724 @@
 +/*
 +HOST_SDL.C
 +
@@ -3856,14 +3942,29 @@ index 00000000..38144076
 +}
 +
 +static uint64_t swaps;
++static uint64_t last_swap_at;
 +
 +int host_sdl_gl_swap_window(uint32_t window)
 +{
++	uint64_t now;
++
 +	(void)window;
 +	ps4gl_swap_buffers(gl_context);
 +	if (++swaps == 1)
 +		ps4_boot_trace("gl: first frame presented");
 +	host_sdl_frame();
++	/* hitches: frames of 50 ms and more, with the shaders made in them */
++	now = milliseconds_now();
++	if (last_swap_at)
++	{
++		unsigned compiled, linked;
++
++		host_gl_frame_counts(&compiled, &linked);
++		if (now - last_swap_at >= 50)
++			host_logf(HOST_LOG_WARN, "hitch: frame %llu took %llu ms (%u shaders compiled, %u programs linked)",
++				(unsigned long long)swaps, (unsigned long long)(now - last_swap_at), compiled, linked);
++	}
++	last_swap_at = now;
 +	return 1;
 +}
 +
@@ -4365,10 +4466,10 @@ index 00000000..38144076
 +}
 diff --git a/port/ps4/host/host_syscall.c b/port/ps4/host/host_syscall.c
 new file mode 100644
-index 00000000..c70fb443
+index 00000000..f328939a
 --- /dev/null
 +++ b/port/ps4/host/host_syscall.c
-@@ -0,0 +1,986 @@
+@@ -0,0 +1,1232 @@
 +/*
 +HOST_SYSCALL.C
 +
@@ -4391,7 +4492,12 @@ index 00000000..c70fb443
 +- memory mappings stay below 4 GB (host_memory.c);
 +- the standard output and error streams go to the host's log;
 +- a read into a write-watched page would fail with EFAULT on the PS4 (it
-+  does not fault): the pages are opened first (host_memory_prepare_write).
++  does not fault): the pages are opened first (host_memory_prepare_write);
++- large writes (a checkpoint's 20 MB savegame.bin) are made by a thread of
++  their own, the data copied first, so the game does not wait for the
++  console's disk; anything else done with that file waits for them, and
++  fsync does nothing (the system writes its cache out itself);
++- the maps the package carries (/app0/maps) stand for the data folder's.
 +*/
 +
 +#include "host.h"
@@ -4624,6 +4730,34 @@ index 00000000..c70fb443
 +static char working_directory[1024] = HOST_DATA_ROOT;
 +static pthread_mutex_t working_directory_lock = PTHREAD_MUTEX_INITIALIZER;
 +
++/* The package's maps (/app0/maps, when it has them) in place of the data
++folder's maps folder; 0, or -errno */
++static long bundled_maps(char *path, size_t size)
++{
++	static const char data_maps[] = HOST_DATA_ROOT "/maps";
++	static int bundled = -1;
++	char rewritten[1024];
++
++	if (strncmp(path, data_maps, sizeof(data_maps) - 1) ||
++		(path[sizeof(data_maps) - 1] && path[sizeof(data_maps) - 1] != '/'))
++		return 0;
++	if (bundled < 0)
++	{
++		struct stat information;
++
++		bundled = stat(HOST_PACKAGE_ROOT "/maps/ui.map", &information) == 0;
++		host_logf(HOST_LOG_INFO, "maps: %s", bundled ? "the package's (" HOST_PACKAGE_ROOT "/maps)" :
++			"the data folder's (" HOST_DATA_ROOT "/maps)");
++	}
++	if (!bundled)
++		return 0;
++	if ((size_t)snprintf(rewritten, sizeof(rewritten), HOST_PACKAGE_ROOT "/maps%s",
++			path + sizeof(data_maps) - 1) >= size)
++		return -G_ENAMETOOLONG;
++	strcpy(path, rewritten);
++	return 0;
++}
++
 +/* the host path of a guest path (relative to the working directory, or to
 +the directory dirfd when it is not AT_FDCWD: not supported); 0, or -errno */
 +static long host_path(int dirfd, uint64_t address, char *result, size_t size)
@@ -4648,7 +4782,9 @@ index 00000000..c70fb443
 +			written = snprintf(result, size, "%s/%s", working_directory, path[0] == '.' && path[1] == '/' ? path + 2 : path);
 +		pthread_mutex_unlock(&working_directory_lock);
 +	}
-+	return written < 0 || (size_t)written >= size ? -G_ENAMETOOLONG : 0;
++	if (written < 0 || (size_t)written >= size)
++		return -G_ENAMETOOLONG;
++	return bundled_maps(result, size);
 +}
 +
 +static int host_open_flags(int flags)
@@ -4957,6 +5093,147 @@ index 00000000..c70fb443
 +	}
 +}
 +
++/* ---------- large writes on a thread of their own */
++
++#define WRITE_BEHIND_MINIMUM (128 * 1024)
++#define WRITE_BEHIND_LIMIT (96u << 20)
++#define WRITE_BEHIND_DESCRIPTORS 1024
++
++struct pending_write
++{
++	struct pending_write *next;
++	int fd;
++	off_t offset;
++	size_t size;
++	uint8_t data[];
++};
++
++static pthread_mutex_t write_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t write_work = PTHREAD_COND_INITIALIZER;
++static pthread_cond_t write_done = PTHREAD_COND_INITIALIZER;
++static struct pending_write *write_head, *write_tail;
++static size_t write_bytes;
++static int write_pending[WRITE_BEHIND_DESCRIPTORS];
++static int write_thread_started;
++
++static void *write_main(void *unused)
++{
++	(void)unused;
++	for (;;)
++	{
++		struct pending_write *write;
++		size_t done = 0;
++
++		pthread_mutex_lock(&write_lock);
++		while (!write_head)
++			pthread_cond_wait(&write_work, &write_lock);
++		write = write_head;
++		write_head = write->next;
++		if (!write_head)
++			write_tail = NULL;
++		pthread_mutex_unlock(&write_lock);
++		while (done < write->size)
++		{
++			ssize_t written = pwrite(write->fd, write->data + done, write->size - done, write->offset + (off_t)done);
++
++			if (written <= 0)
++			{
++				host_logf(HOST_LOG_ERROR, "write of %zu bytes at %lld to file %d failed (%d)", write->size,
++					(long long)write->offset, write->fd, errno);
++				break;
++			}
++			done += (size_t)written;
++		}
++		pthread_mutex_lock(&write_lock);
++		write_bytes -= write->size;
++		write_pending[write->fd]--;
++		pthread_cond_broadcast(&write_done);
++		pthread_mutex_unlock(&write_lock);
++		free(write);
++	}
++	return NULL;
++}
++
++/* waits for the writes of fd still being made */
++static void write_wait(int fd)
++{
++	if (fd < 0 || fd >= WRITE_BEHIND_DESCRIPTORS || !__atomic_load_n(&write_pending[fd], __ATOMIC_ACQUIRE))
++		return;
++	pthread_mutex_lock(&write_lock);
++	while (write_pending[fd])
++		pthread_cond_wait(&write_done, &write_lock);
++	pthread_mutex_unlock(&write_lock);
++}
++
++void host_syscall_flush(void)
++{
++	pthread_mutex_lock(&write_lock);
++	while (write_head || write_bytes)
++		pthread_cond_wait(&write_done, &write_lock);
++	pthread_mutex_unlock(&write_lock);
++}
++
++/* takes a large write to a regular file (at offset, or at the file's position
++when offset < 0) for the writer thread; the size, or -1 when it is made here */
++static long write_behind(int fd, const void *data, size_t size, off_t offset)
++{
++	struct pending_write *write;
++	struct stat information;
++
++	if (size < WRITE_BEHIND_MINIMUM || fd < 3 || fd >= WRITE_BEHIND_DESCRIPTORS)
++		return -1;
++	if (fstat(fd, &information) != 0 || !S_ISREG(information.st_mode) || (fcntl(fd, F_GETFL) & O_APPEND))
++		return -1;
++	pthread_mutex_lock(&write_lock);
++	if (write_bytes + size > WRITE_BEHIND_LIMIT)
++	{
++		pthread_mutex_unlock(&write_lock);
++		return -1;
++	}
++	pthread_mutex_unlock(&write_lock);
++	write = malloc(sizeof(*write) + size);
++	if (!write)
++		return -1;
++	if (offset < 0)
++	{
++		offset = lseek(fd, 0, SEEK_CUR);
++		if (offset < 0 || lseek(fd, (off_t)size, SEEK_CUR) < 0)
++		{
++			free(write);
++			return -1;
++		}
++	}
++	memcpy(write->data, data, size);
++	write->next = NULL;
++	write->fd = fd;
++	write->offset = offset;
++	write->size = size;
++	pthread_mutex_lock(&write_lock);
++	if (!write_thread_started)
++	{
++		pthread_t thread;
++
++		write_thread_started = pthread_create(&thread, NULL, write_main, NULL) == 0;
++		if (!write_thread_started)
++		{
++			pthread_mutex_unlock(&write_lock);
++			lseek(fd, offset, SEEK_SET);
++			free(write);
++			return -1;
++		}
++	}
++	if (write_tail)
++		write_tail->next = write;
++	else
++		write_head = write;
++	write_tail = write;
++	write_bytes += size;
++	write_pending[fd]++;
++	pthread_cond_signal(&write_work);
++	pthread_mutex_unlock(&write_lock);
++	return (long)size;
++}
++
 +/* ---------- clocks */
 +
 +static clockid_t host_clock(int64_t clock)
@@ -4973,18 +5250,26 @@ index 00000000..c70fb443
 +
 +/* ---------- dispatch */
 +
-+long long host_syscall(long long number, long long a, long long b, long long c,
++static long long dispatch(long long number, long long a, long long b, long long c,
 +	long long d, long long e, long long f)
 +{
 +	switch (number)
 +	{
 +	case GUEST_SYS_write:
++	{
++		long behind;
++
 +		if (a == 1 || a == 2)
 +		{
 +			log_bytes((int)a, GUEST(const char *, b), (size_t)(uint32_t)c);
 +			return (uint32_t)c;
 +		}
++		write_wait((int)a);
++		behind = write_behind((int)a, GUEST(const void *, b), (size_t)(uint32_t)c, -1);
++		if (behind >= 0)
++			return behind;
 +		return result_of(write((int)a, GUEST(const void *, b), (size_t)(uint32_t)c));
++	}
 +	case GUEST_SYS_read:
 +		host_memory_prepare_write((uint64_t)(uint32_t)b, (uint32_t)c);
 +		return result_of(read((int)a, GUEST(void *, b), (size_t)(uint32_t)c));
@@ -4992,7 +5277,15 @@ index 00000000..c70fb443
 +		host_memory_prepare_write((uint64_t)(uint32_t)b, (uint32_t)c);
 +		return result_of(pread((int)a, GUEST(void *, b), (size_t)(uint32_t)c, (off_t)d));
 +	case GUEST_SYS_pwrite64:
++	{
++		long behind;
++
++		write_wait((int)a);
++		behind = write_behind((int)a, GUEST(const void *, b), (size_t)(uint32_t)c, (off_t)d);
++		if (behind >= 0)
++			return behind;
 +		return result_of(pwrite((int)a, GUEST(const void *, b), (size_t)(uint32_t)c, (off_t)d));
++	}
 +	case GUEST_SYS_writev:
 +		return guest_rw_vector((int)a, (uint64_t)b, (int)c, 0, 0, 1);
 +	case GUEST_SYS_pwritev:
@@ -5067,7 +5360,8 @@ index 00000000..c70fb443
 +		return result_of(ftruncate((int)a, (off_t)b));
 +	case GUEST_SYS_fsync:
 +	case GUEST_SYS_fdatasync:
-+		return result_of(fsync((int)a));
++		/* (the console writes its cache out itself; a sync is a hitch) */
++		return 0;
 +	case GUEST_SYS_fcntl:
 +		switch ((int)b)
 +		{
@@ -5354,6 +5648,59 @@ index 00000000..c70fb443
 +		host_logf(HOST_LOG_WARN, "guest system call %lld is not supported", number);
 +		return -G_ENOSYS;
 +	}
++}
++
++static uint64_t now_microseconds(void)
++{
++	struct timespec now;
++
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	return (uint64_t)now.tv_sec * 1000000 + (uint64_t)now.tv_nsec / 1000;
++}
++
++long long host_syscall(long long number, long long a, long long b, long long c,
++	long long d, long long e, long long f)
++{
++	uint64_t start;
++	long long result;
++
++	switch (number)
++	{
++	/* (descriptor first) everything else done with a file waits for its
++	writes on the writer thread */
++	case GUEST_SYS_read:
++	case GUEST_SYS_pread64:
++	case GUEST_SYS_readv:
++	case GUEST_SYS_preadv:
++	case GUEST_SYS_writev:
++	case GUEST_SYS_pwritev:
++	case GUEST_SYS_close:
++	case GUEST_SYS_lseek:
++	case GUEST_SYS_fstat:
++	case GUEST_SYS_ftruncate:
++	case GUEST_SYS_fcntl:
++	case GUEST_SYS_dup:
++	case GUEST_SYS_dup3:
++		write_wait((int)a);
++		break;
++	/* waits that are meant to take long */
++	case GUEST_SYS_futex:
++	case GUEST_SYS_nanosleep:
++	case GUEST_SYS_clock_nanosleep:
++	case GUEST_SYS_ppoll:
++	case GUEST_SYS_sched_yield:
++		return dispatch(number, a, b, c, d, e, f);
++	default:
++		break;
++	}
++	start = now_microseconds();
++	result = dispatch(number, a, b, c, d, e, f);
++	start = now_microseconds() - start;
++	if (start >= 30000)
++		host_logf(HOST_LOG_WARN, "slow: system call %lld (%llx, %llx, %llx) took %llu ms", number,
++			(unsigned long long)a, (unsigned long long)b, (unsigned long long)c,
++			(unsigned long long)(start / 1000));
++	return result;
 +}
 diff --git a/port/ps4/host/host_thread.c b/port/ps4/host/host_thread.c
 new file mode 100644
@@ -5784,10 +6131,10 @@ index 308fe1fa..41aab3de 100644
              f"\t.type {name},%function",
 diff --git a/tools/ps4_build.py b/tools/ps4_build.py
 new file mode 100644
-index 00000000..a6076e62
+index 00000000..61647079
 --- /dev/null
 +++ b/tools/ps4_build.py
-@@ -0,0 +1,381 @@
+@@ -0,0 +1,388 @@
 +"""Ninja rules for the PS4 build's guest (``ninja ps4``).
 +
 +The PS4 port (port/ps4/README.md) runs the game as the Android port does
@@ -5816,9 +6163,9 @@ index 00000000..a6076e62
 +from .android_build import (EXPAT_DIR, EXPAT_SOURCES, KCP_DIR, MONOCYPHER_DIR, MUSL_DIRECTORIES, MUSL_EXCLUDE,
 +                            MUSL_FILES, MUSL_SHA256, MUSL_THREAD_PREFIXES, MUSL_URL, MUSL_VERSION, SDL_COMMIT, SDL_TAG,
 +                            SDL_URL, TOML_DIR, VARIADIC_PROTOTYPE_FILES, ZLIB_DEFINES, ZLIB_DIR, ZLIB_SOURCES)
-+from .linux_build import (MUSL_MATH_DIR, STB_VORBIS_SOURCE, XDK_INCLUDE, compile_launcher, configuration_defines,
-+                          game_defines_and_includes, game_sources, musl_math_sources, opus_cflags, opus_sources,
-+                          updater_defines, xdk_headers)
++from .linux_build import (LINUX_PROFILE, MUSL_MATH_DIR, STB_VORBIS_SOURCE, XDK_INCLUDE, compile_launcher,
++                          configuration_defines, game_defines_and_includes, game_sources, musl_math_sources,
++                          opus_cflags, opus_sources, pgo_profile, profile_use_flags, updater_defines, xdk_headers)
 +from .embed_assets import hud_assets_build, hud_configure_inputs
 +from .ninja_syntax import Writer
 +
@@ -6038,12 +6385,19 @@ index 00000000..a6076e62
 +    ]
 +    guest_abi = " ".join(GUEST_ABI_FLAGS + configuration_defines(sln))
 +    guest_code = " ".join(GUEST_CODE_FLAGS)
++    # profile-guided optimisation with the Linux build's profile (as the
++    # Android guest: the game and platform code are the same). (No link-time
++    # optimisation: ld.lld takes x32 bitcode for 64-bit ELF.)
++    profile = pgo_profile(sln, None, [LINUX_PROFILE], guest_cc)
++    profile_flags = " ".join(profile_use_flags(profile) + ["-Wno-backend-plugin"])
++    lto_flags = ""
 +
 +    def guest_object(source: Path, cflags: str, prefix: str = "") -> Path:
 +        obj = obj_dir / prefix / Path(str(source).lstrip("/")).with_suffix(".o")
 +        if str(source).startswith(str(BUILD)):
 +            obj = obj_dir / prefix / source.relative_to(BUILD).with_suffix(".o")
-+        n.build(outputs=obj, rule="ps4_guest_cc", inputs=source, implicit=generated_headers,
++        n.build(outputs=obj, rule="ps4_guest_cc", inputs=source,
++                implicit=generated_headers + ([profile] if profile and "-fprofile-use" in cflags else []),
 +                variables={"cflags": cflags})
 +        return obj
 +
@@ -6071,7 +6425,7 @@ index 00000000..a6076e62
 +        "-Wno-error=return-type",
 +    ]
 +    game_cflags = " ".join([
-+        guest_abi, guest_code, " ".join(game_flags),
++        guest_abi, guest_code, " ".join(game_flags), profile_flags, lto_flags,
 +        f"-include {prefix_header}", f"-include {semantics_header}",
 +        f"-I{LINUX_DIR}/include",
 +        f"-iquote {Path(config['game_sources'])}",
@@ -6092,7 +6446,7 @@ index 00000000..a6076e62
 +
 +    # the platform layer shared with Linux, and the guest runtime
 +    platform_cflags = " ".join([
-+        guest_abi, guest_code, "-std=gnu11", "-D_GNU_SOURCE", "-DHALO_LINUX_PLATFORM_LAYER", "-w",
++        guest_abi, guest_code, "-std=gnu11", "-D_GNU_SOURCE", "-DHALO_LINUX_PLATFORM_LAYER", "-w", profile_flags, lto_flags,
 +        f"-include {prefix_header}", f"-include {platform_semantics_header}",
 +        f"-I{LINUX_DIR}/src", f"-I{LINUX_DIR}/include", f"-I{runtime_dir}",
 +        f"-I{ANDROID_DIR}/include", f"-I{TOML_DIR}", f"-I{EXPAT_DIR}", f"-I{KCP_DIR}", f"-I{MONOCYPHER_DIR}",
@@ -6155,7 +6509,7 @@ index 00000000..a6076e62
 +    n.rule(
 +        name="ps4_guest_link",
 +        command=(f"$ps4_guest_ld -m elf32_x86_64 -static -nostdlib -T {linker_script} "
-+                 f"-Map $out.map -o $out @$out.rsp {libguestc}"),
++                 f"-O2 -Map $out.map -o $out @$out.rsp {libguestc}"),
 +        description="PS4 LINK $out",
 +        rspfile="$out.rsp",
 +        rspfile_content="$in_newline",

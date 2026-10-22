@@ -232,8 +232,10 @@ VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevi
 VKAPI_ATTR VkResult VKAPI_CALL GetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice, VkSurfaceKHR,
                                                                        VkSurfaceCapabilitiesKHR* caps) {
     *caps = {};
-    caps->minImageCount = 2;
-    caps->maxImageCount = 3;  // as DolphinPS4: render into one while one is shown and one is queued
+    // three: render into one while one is shown and one is queued (Zink's swapchain takes the minimum; with two, a
+    // frame a little over 16.7 ms waited for the next vblank and the game dropped to 30)
+    caps->minImageCount = 3;
+    caps->maxImageCount = 3;
     caps->currentExtent = {kScreenWidth, kScreenHeight};
     caps->minImageExtent = caps->currentExtent;
     caps->maxImageExtent = caps->currentExtent;

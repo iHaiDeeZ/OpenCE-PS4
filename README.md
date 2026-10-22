@@ -4,7 +4,7 @@
 decompilation, for jailbroken PS4 consoles (GoldHEN), built the way the SMW port is: the PS4 runtime, toolchain and
 Mesa RADV of SMW/SSBU, a package with its own home screen art, logs and crash reports in `/data/OpenCE`.
 
-**Status: v00.03.** v00.02 ran on the console: the game started (x32 code, memory, settings) and reached OpenGL, then crashed in Zink's shader cache setup (fixed in v00.03, untested).
+**Status: v00.04.** v00.03 plays: menus, loading and gameplay work, with hitches at checkpoints and in busy scenes. v00.04 works on those: Mesa's shader cache on (it never was), Gallium's threaded context and glthread on (Mesa saw one core), a third swapchain image and two frames in flight, checkpoints written on a thread of their own, the game built with OpenCE's profile-guided optimisation profile (clang 22), and the maps in the package. Untested.
 
 ## How it works
 
@@ -31,11 +31,13 @@ Android port already does this with AArch64 code in a 64-bit app; this port does
 |---|---|
 | `/data/OpenCE` | the game data: `maps/` (from your disc image), `config.toml` (the settings), `debug.txt` (the game's log) |
 | `/data/OpenCE/save` | saved games and profiles |
-| `/data/OpenCE` | `opence.log` (the PS4 host's log), `boot-trace.log`, `crash.log`, `mesa/` (the shader cache) |
+| `/data/OpenCE` | `opence.log` (the PS4 host's log: also `hitch:` lines for frames of 50 ms and more, `slow:` for system calls of 30 ms and more), `boot-trace.log`, `crash.log`, `mesa/` (the shader cache) |
+| `/data/OpenCE/env.txt` | optional `NAME=value` lines for Mesa, read at start: `mesa_glthread=false`, `GALLIUM_THREAD=0`, `ZINK_DEBUG=...` |
 
 Title ID `OPCE00001`. Install `out/OpenCE-vXX.YY.pkg` with GoldHEN's Package Installer.
 
-**The game data:** the `maps` folder of your own Xbox copy of Halo: Combat Evolved goes in `/data/OpenCE/maps` over
+**The game data:** `scripts/build-opence.sh` puts the maps of your own copy in the package (`OPENCE_MAPS`, default
+`E:\OpenCE-data\Halo - Combat Evolved\maps`): such a package is yours alone, never share it. Without them, the `maps` folder of your own Xbox copy of Halo: Combat Evolved goes in `/data/OpenCE/maps` over
 FTP (the 24 `.map` files, about 1.8 GB; an extracted game folder has it as it is). Or put your Xbox disc image
 (`.iso` or `.xiso`, any version) in `/data/OpenCE`: at the first start the game extracts the `maps` folder from it,
 and the image can be deleted afterwards. Nothing of the game's data is in the package.

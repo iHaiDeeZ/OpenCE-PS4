@@ -16,3 +16,7 @@ maps/
 modules/
 out/
 private/
+# the home screen art's sources: your game's (scripts/make-art.py)
+art/
+# your console captures
+clips/
