@@ -4,7 +4,7 @@
 decompilation, for jailbroken PS4 consoles (GoldHEN), built the way the SMW port is: the PS4 runtime, toolchain and
 Mesa RADV of SMW/SSBU, a package with its own home screen art, logs and crash reports in `/data/OpenCE`.
 
-**Status: v00.02, untested on a console.** Everything compiles, links and packages; nothing has run on a PS4 yet.
+**Status: v00.03.** v00.02 ran on the console: the game started (x32 code, memory, settings) and reached OpenGL, then crashed in Zink's shader cache setup (fixed in v00.03, untested).
 
 ## How it works
 

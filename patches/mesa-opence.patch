@@ -1,7 +1,7 @@
 From 5d59d4c59cb7260ff29ce9b1e8cae5c406f7ce01 Mon Sep 17 00:00:00 2001
 From: ShiroKlein <ihaideezi@gmail.com>
 Date: Wed, 21 Oct 2026 08:41:54 +0300
-Subject: [PATCH] PS4: Zink for OpenGL - the app's Vulkan entry, a headless
+Subject: [PATCH 1/2] PS4: Zink for OpenGL - the app's Vulkan entry, a headless
  kopper surface, the PS4 frontend (src/gallium/frontends/ps4), hud_cpu without
  kern.cp_time
 
@@ -611,6 +611,39 @@ index 9b02fd1..eb36e7f 100644
  else
    driver_zink = declare_dependency()
  endif
+-- 
+2.53.0
+
+
+From 3934b61b3f3b23a2cfc559e45edfa79dc788c22c Mon Sep 17 00:00:00 2001
+From: ShiroKlein <ihaideezi@gmail.com>
+Date: Thu, 22 Oct 2026 07:04:18 +0300
+Subject: [PATCH 2/2] PS4: Zink's shader cache named by a fixed build id (the
+ app has no build id note)
+
+---
+ src/gallium/drivers/zink/zink_screen.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/gallium/drivers/zink/zink_screen.c b/src/gallium/drivers/zink/zink_screen.c
+index e5774a0..52db93b 100644
+--- a/src/gallium/drivers/zink/zink_screen.c
++++ b/src/gallium/drivers/zink/zink_screen.c
+@@ -308,7 +308,13 @@ disk_cache_init(struct zink_screen *screen)
+    struct mesa_blake3 ctx;
+    _mesa_blake3_init(&ctx);
+ 
+-#if HAVE_BUILD_ID
++#if defined(__PS4__)
++   /* PS4: Zink is linked into the app, which has no build id note to find
++    * (it crashed reading a NULL one); the build is named here instead, and
++    * renamed when the shaders it makes change */
++   static const char ps4_build[] = "opence-zink-ps4-1";
++   _mesa_blake3_update(&ctx, ps4_build, sizeof(ps4_build));
++#elif HAVE_BUILD_ID
+    /* Hash in the zink driver build. */
+    const struct build_id_note *note =
+        build_id_find_nhdr_for_addr(disk_cache_init);
 -- 
 2.53.0
 
